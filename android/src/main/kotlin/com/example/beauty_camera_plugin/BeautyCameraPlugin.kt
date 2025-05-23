@@ -22,6 +22,13 @@ class BeautyCameraPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     private var activity: Activity? = null
     private lateinit var context: Context
     private var cameraManager: CameraManager? = null
+    private var cameraGLSurfaceView: CameraGLSurfaceView? = null // Thêm để lưu trữ GL view
+
+    // State preservation fields
+    private var savedLensFacing: Int? = null
+    private var savedZoomRatio: Float? = null
+    private var savedFlashMode: String? = null
+    private var savedFilterType: String? = null
 
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         this.context = flutterPluginBinding.applicationContext
@@ -42,14 +49,32 @@ class BeautyCameraPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                 if (activity != null && activity is LifecycleOwner) {
                     // Ensure CameraManager is initialized here, as activity is confirmed.
                     if (cameraManager == null) {
-                        cameraManager = CameraManager(context, activity!!, activity as LifecycleOwner)
+                        Log.i(TAG, "Creating new CameraManager in initializeCamera. Saved state: lens=$savedLensFacing, zoom=$savedZoomRatio, flash=$savedFlashMode, filter=$savedFilterType")
+                        cameraManager = CameraManager(
+                            context,
+                            activity!!,
+                            activity as LifecycleOwner,
+                            initialLensFacing = savedLensFacing,
+                            initialZoomRatio = savedZoomRatio,
+                            initialFlashMode = savedFlashMode,
+                            initialFilterType = savedFilterType
+                        )
                     }
-                    cameraManager?.initializeCamera { success: Boolean, error: String? ->
-                        if (success) {
-                            result.success(null)
-                        } else {
-                            result.error("INIT_FAILED", error ?: "Camera initialization failed", null)
+                    // Bây giờ initializeCamera cần CameraGLSurfaceView
+                    if (cameraGLSurfaceView != null) {
+                        cameraManager?.initializeCamera(cameraGLSurfaceView!!) { success: Boolean, error: String? ->
+                            if (success) {
+                                result.success(null)
+                            } else {
+                                result.error("INIT_FAILED", error ?: "Camera initialization failed", null)
+                            }
                         }
+                    } else {
+                        // GLSurfaceView chưa sẵn sàng. Điều này có thể xảy ra nếu initializeCamera
+                        // được gọi trước khi PlatformView được hiển thị đầy đủ.
+                        // Cần một cơ chế để xử lý trường hợp này, ví dụ: đợi hoặc báo lỗi.
+                        Log.e(TAG, "CameraGLSurfaceView is not available for initializeCamera yet.")
+                        result.error("VIEW_NOT_READY", "CameraGLSurfaceView not ready for initialization. Ensure the camera preview widget is visible.", null)
                     }
                 } else {
                     result.error("NO_ACTIVITY", "Activity not available or not a LifecycleOwner for camera initialization.", null)
@@ -126,9 +151,21 @@ class BeautyCameraPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                     result.error("INVALID_ARGS", "zoom argument is missing or not a Double", null)
                 }
             }
-            "dispose" -> {
+            "dispose" -> { // This is called when the Flutter CameraController is disposed.
+                Log.i(TAG, "MethodChannel 'dispose' called. Saving state and disposing CameraManager.")
+                // Save current camera state before disposing
+                cameraManager?.let {
+                    savedLensFacing = it.getCurrentLensFacing()
+                    savedZoomRatio = it.getCurrentZoomRatio()
+                    savedFlashMode = it.getCurrentFlashMode()
+                    savedFilterType = it.getCurrentFilterType()
+                    Log.i(TAG, "Saved state before dispose: lens=$savedLensFacing, zoom=$savedZoomRatio, flash=$savedFlashMode, filter=$savedFilterType")
+                }
                 cameraManager?.dispose()
                 cameraManager = null // Ensure it's nullified after disposal
+                // DO NOT nullify cameraGLSurfaceView here.
+                // Its lifecycle is tied to the PlatformView's registration/unregistration.
+                Log.i(TAG, "MethodChannel 'dispose': CameraManager disposed. Kept cameraGLSurfaceView (current: $cameraGLSurfaceView) for PlatformView lifecycle.")
                 result.success(null)
             }
             else -> {
@@ -138,10 +175,43 @@ class BeautyCameraPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        Log.i(TAG, "onDetachedFromEngine called. Saving state and disposing CameraManager.")
         channel.setMethodCallHandler(null)
+        // Save current camera state before disposing
+        cameraManager?.let {
+            savedLensFacing = it.getCurrentLensFacing()
+            savedZoomRatio = it.getCurrentZoomRatio()
+            savedFlashMode = it.getCurrentFlashMode()
+            savedFilterType = it.getCurrentFilterType()
+            Log.i(TAG, "Saved state in onDetachedFromEngine: lens=$savedLensFacing, zoom=$savedZoomRatio, flash=$savedFlashMode, filter=$savedFilterType")
+        }
         cameraManager?.dispose() // Dispose camera resources when plugin is detached
         cameraManager = null
+        cameraGLSurfaceView = null // This is fine here as the engine is detaching
         activity = null // Clear activity reference
+        Log.i(TAG, "onDetachedFromEngine finished.")
+    }
+
+    // Phương thức để CameraPlatformView đăng ký GLSurfaceView
+    fun registerView(view: CameraGLSurfaceView) {
+        Log.i(TAG, "registerView called with view: $view. Current plugin.cameraGLSurfaceView was: ${this.cameraGLSurfaceView}")
+        this.cameraGLSurfaceView = view
+        Log.i(TAG, "plugin.cameraGLSurfaceView is NOW: ${this.cameraGLSurfaceView} after registration.")
+        // Nếu cameraManager đã được tạo và đang chờ view, có thể thử khởi tạo ở đây
+        // Hoặc, hàm initializeCamera từ Dart sẽ xử lý.
+    }
+
+    fun unregisterView(view: CameraGLSurfaceView?) { // Allow nullable to be safe
+        Log.i(TAG, "unregisterView called with viewBeingDisposed: $view. Current plugin.cameraGLSurfaceView: ${this.cameraGLSurfaceView}")
+        if (this.cameraGLSurfaceView == view && view != null) { // Only unregister if it's the current view and not null
+            this.cameraGLSurfaceView = null
+            Log.i(TAG, "Unregistered matching CameraGLSurfaceView. plugin.cameraGLSurfaceView is NOW NULL.")
+        } else if (view == null) {
+            Log.w(TAG, "unregisterView called with null view. No action taken on plugin.cameraGLSurfaceView (${this.cameraGLSurfaceView}).")
+        }
+        else {
+            Log.w(TAG, "Skipped unregistering CameraGLSurfaceView. View being disposed ($view) does not match current (${this.cameraGLSurfaceView}).")
+        }
     }
 
     // ActivityAware methods
@@ -166,8 +236,16 @@ class BeautyCameraPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         Log.d(TAG, "getCameraManager called. Current cameraManager: $cameraManager, activity: $activity")
         // Initialize cameraManager if it hasn't been, and activity is available.
         if (cameraManager == null && activity != null && activity is LifecycleOwner) {
-            Log.i(TAG, "CameraManager is null in getCameraManager and activity is valid. Initializing CameraManager now.")
-            cameraManager = CameraManager(context, activity!!, activity as LifecycleOwner)
+            Log.i(TAG, "Creating new CameraManager in getCameraManager. Saved state: lens=$savedLensFacing, zoom=$savedZoomRatio, flash=$savedFlashMode, filter=$savedFilterType")
+            cameraManager = CameraManager(
+                context,
+                activity!!,
+                activity as LifecycleOwner,
+                initialLensFacing = savedLensFacing,
+                initialZoomRatio = savedZoomRatio,
+                initialFlashMode = savedFlashMode,
+                initialFilterType = savedFilterType
+            )
         } else if (cameraManager == null) {
             Log.w(TAG, "CameraManager is null in getCameraManager, but activity ($activity) is not ready or not a LifecycleOwner.")
         } else {

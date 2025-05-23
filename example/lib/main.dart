@@ -2,7 +2,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
-import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:beauty_camera_plugin/beauty_camera_plugin.dart';
 import 'package:permission_handler/permission_handler.dart'; // Import permission_handler
@@ -14,7 +13,7 @@ void main() {
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({Key? key}) : super(key: key);
+  const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -78,9 +77,11 @@ class _CameraScreenState extends State<CameraScreen>
       print("Camera permission granted.");
       // If view is already created, initialize camera. Otherwise, it will be initialized when view is created.
       if (_isViewCreated && !_isCameraInitialized) {
-         _initializeCamera();
+        _initializeCamera();
       } else if (!_isViewCreated) {
-        print("View not created yet, camera will be initialized once view is ready.");
+        print(
+          "View not created yet, camera will be initialized once view is ready.",
+        );
       }
     } else if (status.isDenied) {
       print("Camera permission denied.");
@@ -107,7 +108,8 @@ class _CameraScreenState extends State<CameraScreen>
       _disposeCamera();
     } else if (state == AppLifecycleState.resumed) {
       // App is in foreground
-      if (_isViewCreated) { // Check if view is created before attempting to reinitialize
+      if (_isViewCreated) {
+        // Check if view is created before attempting to reinitialize
         _requestCameraPermissionAndInitialize(); // Re-check permission and initialize if needed
       }
     }
@@ -115,7 +117,7 @@ class _CameraScreenState extends State<CameraScreen>
 
   Future<void> _initializeCamera() async {
     print("Initializing camera with view created = $_isViewCreated");
-    
+
     if (!_isViewCreated) {
       print("View not created yet, delaying camera initialization");
       setState(() {
@@ -123,17 +125,17 @@ class _CameraScreenState extends State<CameraScreen>
       });
       return;
     }
-    
+
     try {
       // Clear any previous error message
       setState(() {
         _lastErrorMessage = null;
       });
-      
+
       print("Calling plugin.initializeCamera()");
       // Initialize the camera
       await _cameraPlugin.initializeCamera();
-      
+
       print("Camera initialized successfully");
       setState(() {
         _isCameraInitialized = true;
@@ -145,7 +147,7 @@ class _CameraScreenState extends State<CameraScreen>
         _isCameraInitialized = false;
         _lastErrorMessage = 'Failed to initialize camera: $e';
       });
-      
+
       // Try to reinitialize after a short delay if there was an error
       if (_isViewCreated) {
         Future.delayed(Duration(seconds: 2), () {
@@ -164,7 +166,7 @@ class _CameraScreenState extends State<CameraScreen>
       print("Already capturing, ignoring duplicate request");
       return;
     }
-    
+
     if (!_isCameraInitialized) {
       print("Camera not initialized, cannot take picture");
       ScaffoldMessenger.of(context).showSnackBar(
@@ -177,14 +179,16 @@ class _CameraScreenState extends State<CameraScreen>
     }
 
     // No need to set _isCapturing = true here as it's set by the button handler
-    
+
     try {
       print("Taking picture request initiated at ${DateTime.now()}");
       // Display visual feedback for capture
       HapticFeedback.mediumImpact();
-      
+
       final String? imagePath = await _cameraPlugin.takePicture();
-      print("Picture taken successfully at ${DateTime.now()}, path: $imagePath");
+      print(
+        "Picture taken successfully at ${DateTime.now()}, path: $imagePath",
+      );
 
       setState(() {
         _isCapturing = false;
@@ -194,13 +198,13 @@ class _CameraScreenState extends State<CameraScreen>
         _showPhotoPreviewDialog(imagePath);
       } else {
         print("Image path is null, picture might not have been saved");
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to save picture')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Failed to save picture')));
       }
     } catch (e) {
       print("Error taking picture at ${DateTime.now()}: $e");
-      
+
       // Reset capturing state
       setState(() {
         _isCapturing = false;
@@ -352,7 +356,11 @@ class _CameraScreenState extends State<CameraScreen>
               child: AndroidView(
                 viewType: 'com.example/camera_preview_view',
                 layoutDirection: TextDirection.ltr,
-                creationParams: const <String, dynamic>{}, // Keep empty or pass necessary params
+                creationParams:
+                    const <
+                      String,
+                      dynamic
+                    >{}, // Keep empty or pass necessary params
                 creationParamsCodec: const StandardMessageCodec(),
                 onPlatformViewCreated: (int id) {
                   // This callback is when the native view is ready.
@@ -364,10 +372,11 @@ class _CameraScreenState extends State<CameraScreen>
                   _requestCameraPermissionAndInitialize();
                 },
                 // Optional: Add gesture recognizers if needed, but start simple
-                gestureRecognizers: const <Factory<OneSequenceGestureRecognizer>>{},
+                gestureRecognizers:
+                    const <Factory<OneSequenceGestureRecognizer>>{},
               ),
             ),
-            
+
             // Loading indicator shown before camera is initialized
             if (!_isCameraInitialized)
               const Positioned.fill(
@@ -414,8 +423,12 @@ class _CameraScreenState extends State<CameraScreen>
                 child: Container(
                   height: 100, // Increased height to prevent overflow
                   decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.7), // Increased opacity for better visibility
-                    borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
+                    color: Colors.black.withOpacity(
+                      0.7,
+                    ), // Increased opacity for better visibility
+                    borderRadius: BorderRadius.vertical(
+                      top: Radius.circular(12),
+                    ),
                   ),
                   child: Column(
                     children: [
@@ -457,24 +470,6 @@ class _CameraScreenState extends State<CameraScreen>
                               currentFilter: _currentFilter,
                               onPressed: _setFilter,
                             ),
-                            FilterButton(
-                              name: 'Negative',
-                              filterType: 'negative',
-                              currentFilter: _currentFilter,
-                              onPressed: _setFilter,
-                            ),
-                            FilterButton(
-                              name: 'Solarize',
-                              filterType: 'solarize',
-                              currentFilter: _currentFilter,
-                              onPressed: _setFilter,
-                            ),
-                            FilterButton(
-                              name: 'Posterize',
-                              filterType: 'posterize',
-                              currentFilter: _currentFilter,
-                              onPressed: _setFilter,
-                            ),
                           ],
                         ),
                       ),
@@ -512,32 +507,35 @@ class _CameraScreenState extends State<CameraScreen>
 
                     // Capture button with double-tap protection
                     GestureDetector(
-                      onTap: _isCapturing 
-                        ? null 
-                        : () {
-                            // Debounce to prevent rapid sequential taps
-                            if (_isCapturing) return;
-                            
-                            // Take the picture
-                            _takePicture();
-                            
-                            // Additional protection against rapid taps
-                            setState(() {
-                              _isCapturing = true;
-                            });
-                            
-                            // Re-enable the button after a short delay even if 
-                            // the capture operation hasn't completed yet
-                            // This helps in case the callback is never invoked due to a silent failure
-                            Future.delayed(Duration(seconds: 10), () {
-                              if (mounted && _isCapturing) {
-                                print("Capture timeout - resetting capture state");
+                      onTap:
+                          _isCapturing
+                              ? null
+                              : () {
+                                // Debounce to prevent rapid sequential taps
+                                if (_isCapturing) return;
+
+                                // Take the picture
+                                _takePicture();
+
+                                // Additional protection against rapid taps
                                 setState(() {
-                                  _isCapturing = false;
+                                  _isCapturing = true;
                                 });
-                              }
-                            });
-                          },
+
+                                // Re-enable the button after a short delay even if
+                                // the capture operation hasn't completed yet
+                                // This helps in case the callback is never invoked due to a silent failure
+                                Future.delayed(Duration(seconds: 10), () {
+                                  if (mounted && _isCapturing) {
+                                    print(
+                                      "Capture timeout - resetting capture state",
+                                    );
+                                    setState(() {
+                                      _isCapturing = false;
+                                    });
+                                  }
+                                });
+                              },
                       child: AnimatedContainer(
                         duration: Duration(milliseconds: 200),
                         width: _isCapturing ? 60 : 70,
@@ -548,37 +546,38 @@ class _CameraScreenState extends State<CameraScreen>
                           ),
                           shape: BoxShape.circle,
                           border: Border.all(
-                            color: _isCapturing ? Colors.red : Colors.white, 
-                            width: 3
+                            color: _isCapturing ? Colors.red : Colors.white,
+                            width: 3,
                           ),
                         ),
-                              child: Center(
-                                child: AnimatedSwitcher(
-                                  duration: Duration(milliseconds: 300),
-                                  child: _isCapturing 
+                        child: Center(
+                          child: AnimatedSwitcher(
+                            duration: Duration(milliseconds: 300),
+                            child:
+                                _isCapturing
                                     ? Stack(
-                                        key: ValueKey('capturing'),
-                                        alignment: Alignment.center,
-                                        children: [
-                                          const CircularProgressIndicator(
-                                            color: Colors.red,
-                                            strokeWidth: 3,
-                                          ),
-                                          const Icon(
-                                            Icons.camera_alt,
-                                            color: Colors.black45,
-                                            size: 24,
-                                          ),
-                                        ],
-                                      )
+                                      key: ValueKey('capturing'),
+                                      alignment: Alignment.center,
+                                      children: [
+                                        const CircularProgressIndicator(
+                                          color: Colors.red,
+                                          strokeWidth: 3,
+                                        ),
+                                        const Icon(
+                                          Icons.camera_alt,
+                                          color: Colors.black45,
+                                          size: 24,
+                                        ),
+                                      ],
+                                    )
                                     : const Icon(
-                                        key: ValueKey('ready'),
-                                        Icons.camera_alt,
-                                        color: Colors.black,
-                                        size: 32,
-                                      ),
-                                ),
-                              ),
+                                      key: ValueKey('ready'),
+                                      Icons.camera_alt,
+                                      color: Colors.black,
+                                      size: 32,
+                                    ),
+                          ),
+                        ),
                       ),
                     ),
 
@@ -676,7 +675,7 @@ class FilterButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isSelected = filterType == currentFilter;
-    
+
     // More compact layout with better touch targets
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8.0),

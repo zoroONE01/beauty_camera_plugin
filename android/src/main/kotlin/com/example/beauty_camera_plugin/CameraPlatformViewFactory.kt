@@ -3,7 +3,7 @@ package com.example.beauty_camera_plugin
 import android.content.Context
 import android.util.Log
 import android.view.View
-import androidx.camera.view.PreviewView
+// import androidx.camera.view.PreviewView // Không dùng PreviewView nữa
 import io.flutter.plugin.common.StandardMessageCodec
 import io.flutter.plugin.platform.PlatformView
 import io.flutter.plugin.platform.PlatformViewFactory
@@ -28,40 +28,44 @@ class CameraPlatformView(
     private val plugin: BeautyCameraPlugin
 ) : PlatformView {
     
-    private val previewView: PreviewView
-    private val cameraManager = plugin.getCameraManager() // Get CameraManager instance from plugin
+    private val cameraGLSurfaceView: CameraGLSurfaceView
+    private val cameraManager = plugin.getCameraManager()
     
     init {
-        Log.d(TAG, "CameraPlatformView id $id created. CreationParams: $creationParams")
-        previewView = PreviewView(context).apply {
-            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-            scaleType = PreviewView.ScaleType.FILL_CENTER
-            
-            // Make sure the view is visible by setting a background color
-            setBackgroundColor(android.graphics.Color.BLACK) // Keep black for now to see if view appears
-            
+        Log.i(TAG, "CameraPlatformView id $id: init START. CreationParams: $creationParams")
+        cameraGLSurfaceView = CameraGLSurfaceView(context).apply {
             // Set layout parameters to ensure the view takes up space
             layoutParams = android.view.ViewGroup.LayoutParams(
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT
             )
-            Log.d(TAG, "PreviewView id $id initialized with MATCH_PARENT layout and COMPATIBLE mode.")
+            Log.i(TAG, "CameraPlatformView id $id: CameraGLSurfaceView instance created and layout params set.")
         }
+        // plugin.registerView sẽ log chi tiết
+        plugin.registerView(cameraGLSurfaceView) // Đăng ký view với plugin
+        Log.i(TAG, "CameraPlatformView id $id: Called plugin.registerView with $cameraGLSurfaceView.")
         
-        // Set the PreviewView in the CameraManager
-        if (cameraManager != null) {
-            Log.d(TAG, "Setting PreviewView for CameraManager in CameraPlatformView id $id.")
-            cameraManager.setPreviewView(previewView)
-        } else {
-            Log.e(TAG, "CameraManager is null when trying to set PreviewView in CameraPlatformView id $id.")
+        // CameraManager sẽ cần lấy SurfaceTexture từ CameraGLSurfaceView.renderer
+        // Việc này sẽ được thực hiện trong CameraManager khi nó khởi tạo camera.
+        // Chúng ta không gọi cameraManager.setPreviewView(previewView) nữa.
+        // Thay vào đó, CameraManager sẽ được cập nhật để làm việc với SurfaceTexture.
+        if (cameraManager == null) {
+             Log.e(TAG, "CameraManager is null in CameraPlatformView id $id.")
         }
     }
     
     override fun getView(): View {
-        return previewView
+        return cameraGLSurfaceView
     }
     
     override fun dispose() {
-        Log.d(TAG, "PlatformView $id disposed.")
+        Log.i(TAG, "CameraPlatformView id $id: dispose() called. Current cameraGLSurfaceView instance: $cameraGLSurfaceView")
+        // Quan trọng: Phải gọi onPause của GLSurfaceView để giải phóng tài nguyên OpenGL
+        // và dừng renderer thread một cách an toàn.
+        // Việc này nên được thực hiện trên GL thread, onPause() của GLSurfaceView sẽ queueEvent.
+        cameraGLSurfaceView.onPause() // This will log internally
+        Log.i(TAG, "CameraPlatformView id $id: Called cameraGLSurfaceView.onPause(). Now calling plugin.unregisterView.")
+        plugin.unregisterView(cameraGLSurfaceView) // Hủy đăng ký view với plugin, this will log internally
+        Log.i(TAG, "CameraPlatformView id $id: dispose() finished.")
     }
 }

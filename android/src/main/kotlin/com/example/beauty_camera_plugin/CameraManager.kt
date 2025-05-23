@@ -2,21 +2,26 @@ package com.example.beauty_camera_plugin
 
 import android.app.Activity
 import android.content.Context
-import android.graphics.* 
+import android.graphics.*
 import android.graphics.BitmapFactory
+import android.graphics.SurfaceTexture // Thêm import này
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
-import android.hardware.camera2.CaptureRequest
+// import android.hardware.camera2.CaptureRequest // Không còn dùng trực tiếp cho preview filter
 import android.net.Uri
 import android.util.Log
+import android.util.Size // Thêm import này
 import android.view.Surface
-import androidx.camera.camera2.interop.Camera2Interop
+import android.view.OrientationEventListener
+import androidx.camera.camera2.interop.Camera2CameraInfo
+// import androidx.camera.camera2.interop.Camera2Interop // Không còn dùng cho preview filter
 import androidx.camera.core.*
 import androidx.camera.core.Camera
 import androidx.camera.core.Preview
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
+// import androidx.camera.view.PreviewView // Không dùng PreviewView nữa
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import kotlinx.coroutines.CoroutineScope
@@ -33,7 +38,11 @@ import java.util.LinkedList
 class CameraManager(
     private val context: Context,
     private var activity: Activity,
-    private val lifecycleOwner: LifecycleOwner
+    private val lifecycleOwner: LifecycleOwner,
+    initialLensFacing: Int? = null,
+    initialZoomRatio: Float? = null,
+    initialFlashMode: String? = null,
+    initialFilterType: String? = null
 ) {
     companion object {
         private const val TAG = "CameraManager"
@@ -44,14 +53,39 @@ class CameraManager(
     private var imageCapture: ImageCapture? = null
     private var camera: Camera? = null
     private var cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    private var previewView: PreviewView? = null
+    private var cameraGLSurfaceView: CameraGLSurfaceView? = null
 
-    private var currentFilterType: String = "none"
-    private var cameraSelector: CameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-    private var currentFlashMode: Int = ImageCapture.FLASH_MODE_OFF
+    private var currentFilterType: String
+    private var cameraSelector: CameraSelector
+    private var currentFlashMode: Int
+    private var currentZoomRatio: Float = 0.5f // Default zoom, can be overridden
 
     private val scope = CoroutineScope(Job() + Dispatchers.Main)
     private var _isDisposed = false
+
+    init {
+        this.cameraSelector = initialLensFacing?.let {
+            CameraSelector.Builder().requireLensFacing(it).build()
+        } ?: CameraSelector.DEFAULT_BACK_CAMERA
+        Log.i(TAG, "Initial lens facing: ${if (this.cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) "FRONT" else "BACK"} (from saved: $initialLensFacing)")
+
+        this.currentZoomRatio = initialZoomRatio ?: 0.0f // CameraX zoom is 0.0 (min) to 1.0 (max linear)
+        Log.i(TAG, "Initial zoom ratio: ${this.currentZoomRatio} (from saved: $initialZoomRatio)")
+
+        this.currentFlashMode = when (initialFlashMode?.lowercase()) {
+            "on" -> ImageCapture.FLASH_MODE_ON
+            "auto" -> ImageCapture.FLASH_MODE_AUTO
+            else -> ImageCapture.FLASH_MODE_OFF
+        }
+        Log.i(TAG, "Initial flash mode: ${this.currentFlashMode} (from saved: $initialFlashMode)")
+
+        this.currentFilterType = initialFilterType ?: "none"
+        Log.i(TAG, "Initial filter type: ${this.currentFilterType} (from saved: $initialFilterType)")
+
+        // Apply initial filter to renderer if view is already available (might be too early)
+        // This will be reapplied in bindCameraUseCases or when setFilter is called.
+        // cameraGLSurfaceView?.setFilter(this.currentFilterType)
+    }
     
     // Flag to track if a capture is in progress
     private var isCaptureInProgress = false
@@ -64,137 +98,246 @@ class CameraManager(
         val callback: (String?, String?) -> Unit
     )
 
-    fun initializeCamera(callback: (Boolean, String?) -> Unit) {
-        Log.d(TAG, "initializeCamera called")
-        _isDisposed = false
-        
-        // Check if previewView is set
-        if (previewView == null) {
-            Log.e(TAG, "PreviewView is null in initializeCamera. Cannot initialize camera.")
-            callback(false, "PreviewView is not set. Cannot initialize camera.")
-            return
+    private var orientationEventListener: OrientationEventListener? = null
+    private var lastKnownRotation: Int = Surface.ROTATION_0
+    private var targetResolution: Size? = null // Để lưu kích thước mục tiêu cho preview
+
+    fun initializeCamera(glView: CameraGLSurfaceView, callback: (Boolean, String?) -> Unit) {
+        Log.i(TAG, ">>> initializeCamera START. GLSurfaceView (param): $glView, IsDisposed: $_isDisposed, Current cameraGLSurfaceView: ${this.cameraGLSurfaceView}")
+        if (_isDisposed) {
+            Log.w(TAG, "initializeCamera called on a disposed CameraManager. Re-initializing. Setting _isDisposed to false.")
+            // Potentially reset some state if needed, though _isDisposed = false is key
         }
-        Log.d(TAG, "PreviewView is set in initializeCamera.")
-        
+        _isDisposed = false // Ensure manager is not marked as disposed
+        this.cameraGLSurfaceView = glView
+        Log.i(TAG, "initializeCamera: Assigned GLSurfaceView. this.cameraGLSurfaceView: ${this.cameraGLSurfaceView}, renderer: ${this.cameraGLSurfaceView?.renderer}, surfaceTexture: ${this.cameraGLSurfaceView?.getCameraSurfaceTexture()}")
+
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
+            Log.i(TAG, "initializeCamera: CameraProviderFuture listener invoked. IsDisposed: $_isDisposed")
+            if (_isDisposed) {
+                Log.w(TAG, "initializeCamera: CameraProviderFuture listener: CameraManager is disposed. Aborting.")
+                callback(false, "CameraManager disposed during initialization.")
+                return@addListener
+            }
             try {
                 cameraProvider = cameraProviderFuture.get()
-                Log.d(TAG, "Camera provider obtained successfully.")
-                
-                // Make sure previewView is ready
-                if (previewView?.surfaceProvider != null) {
-                    Log.d(TAG, "PreviewView surface provider is available. Binding use cases.")
-                    bindCameraUseCases()
-                    callback(true, null)
-                } else {
-                    Log.e(TAG, "PreviewView surface provider is null. Posting to check again.")
-                    // Try to attach a listener to the previewView to know when it's ready
-                    previewView?.post {
-                        if (previewView?.surfaceProvider != null) {
-                            Log.d(TAG, "PreviewView surface provider is now available after post. Binding use cases.")
-                            bindCameraUseCases()
-                            callback(true, null)
-                        } else {
-                            Log.e(TAG, "PreviewView surface provider is still null after post.")
-                            callback(false, "PreviewView surface provider is not available.")
-                        }
-                    }
-                }
+                Log.i(TAG, "initializeCamera: CameraProvider obtained: $cameraProvider. Calling bindCameraUseCases().")
+                // Không cần chờ surfaceProvider của PreviewView nữa
+                // GLSurfaceView sẽ tự quản lý surface của nó.
+                // Chúng ta sẽ lấy SurfaceTexture từ renderer của GLSurfaceView.
+                bindCameraUseCases() // Gọi bindCameraUseCases trực tiếp
+                Log.i(TAG, "initializeCamera: bindCameraUseCases() call completed.")
+                callback(true, null)
             } catch (e: Exception) {
-                Log.e(TAG, "Camera provider initialization failed", e)
+                Log.e(TAG, "initializeCamera: Camera provider initialization failed", e)
                 callback(false, "Camera provider initialization failed: ${e.message}")
             }
         }, ContextCompat.getMainExecutor(context))
-    }
+        Log.i(TAG, "initializeCamera: Added listener to cameraProviderFuture.")
 
-    private fun createPreviewUseCase(): Preview {
-        return Preview.Builder()
-            .apply {
-                setTargetRotation(
-                    previewView?.display?.rotation ?: Surface.ROTATION_0
-                )
-                if (currentFilterType != "none") {
-                    val camera2Interop = Camera2Interop.Extender(this)
-                    applyEffectToPreview(camera2Interop, currentFilterType)
+        // Setup orientation listener
+        if (orientationEventListener == null) {
+            orientationEventListener = object : OrientationEventListener(context) {
+                override fun onOrientationChanged(orientation: Int) {
+                    val newDisplayRotation = cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0
+                    if (newDisplayRotation != lastKnownRotation) {
+                        lastKnownRotation = newDisplayRotation
+                        Log.d(TAG, "Device display rotation changed to: $newDisplayRotation")
+                        updateUseCaseRotations(newDisplayRotation)
+                        
+                        // Thông báo cho GLRenderer về sự thay đổi hướng hiển thị
+                        // và các thông số camera khác nếu cần.
+                        val sensorRotation = camera?.cameraInfo?.sensorRotationDegrees ?: 0
+                        cameraGLSurfaceView?.renderer?.setCameraParameters(
+                            targetResolution?.width ?: 0,
+                            targetResolution?.height ?: 0,
+                            sensorRotation,
+                            newDisplayRotation
+                        )
+                    }
                 }
             }
+            orientationEventListener?.enable()
+        }
+    }
+
+    private fun createPreviewUseCase(surfaceTexture: SurfaceTexture): Preview {
+        // Lấy kích thước mục tiêu (ví dụ: 1280x720)
+        // Bạn có thể muốn làm cho nó có thể cấu hình hoặc chọn dựa trên thiết bị
+        targetResolution = Size(1280, 720) // Ví dụ
+        surfaceTexture.setDefaultBufferSize(targetResolution!!.width, targetResolution!!.height)
+        
+        // Thông báo cho GLRenderer về kích thước preview và hướng ban đầu
+        // Lấy sensorRotation ở đây có thể chưa chính xác nếu camera chưa bind.
+        // Sẽ tốt hơn nếu cập nhật sau khi camera được bind.
+        // cameraGLSurfaceView?.renderer?.setCameraParameters(
+        //     targetResolution!!.width,
+        //     targetResolution!!.height,
+        //     0, // Tạm thời là 0, sẽ cập nhật sau khi bind
+        //     cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0
+        // )
+
+        return Preview.Builder()
+            .setTargetResolution(targetResolution!!) // Đặt kích thước mục tiêu
+            .setTargetRotation(cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0) // Quan trọng: CameraX sẽ cố gắng cung cấp frame đã xoay
             .build()
             .also {
-                it.setSurfaceProvider(previewView?.surfaceProvider)
+                // Không dùng setSurfaceProvider với PreviewView nữa
+                // Thay vào đó, chúng ta sẽ cung cấp SurfaceTexture trực tiếp
+                it.setSurfaceProvider { request ->
+                    val surface = Surface(surfaceTexture)
+                    request.provideSurface(surface, ContextCompat.getMainExecutor(context)) {
+                        Log.d(TAG, "Surface released for Preview: ${it.surface}")
+                        surface.release() // Quan trọng: giải phóng surface khi không dùng nữa
+                    }
+                }
+                Log.d(TAG, "Preview use case created with SurfaceTexture target.")
             }
     }
 
     private fun createImageCaptureUseCase(): ImageCapture {
         return ImageCapture.Builder()
-            .setTargetRotation(previewView?.display?.rotation ?: Surface.ROTATION_0)
+            .setTargetRotation(cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0)
             .setFlashMode(currentFlashMode) // Apply current flash mode
             .build()
     }
 
     private fun bindCameraUseCases() {
-        Log.d(TAG, "bindCameraUseCases called")
+        Log.i(TAG, ">>> bindCameraUseCases START. CameraProvider: $cameraProvider, GLView: $cameraGLSurfaceView, IsDisposed: $_isDisposed")
+        if (_isDisposed) {
+            Log.w(TAG, "bindCameraUseCases: CameraManager is disposed. Aborting.")
+            return
+        }
         if (cameraProvider == null) {
-            Log.e(TAG, "CameraProvider is null in bindCameraUseCases. Cannot bind.")
+            Log.e(TAG, "bindCameraUseCases: CameraProvider is null. Cannot bind.")
+            // Consider invoking callback with error if this happens after initialization attempt
             return
         }
-        if (previewView == null) {
-            Log.e(TAG, "PreviewView is null in bindCameraUseCases. Cannot bind.")
+        val glView = cameraGLSurfaceView // Capture current value
+        if (glView == null) {
+            Log.e(TAG, "bindCameraUseCases: CameraGLSurfaceView (this.cameraGLSurfaceView) is null. Cannot bind. This should not happen if initializeCamera was called.")
+            // Consider invoking callback with error
             return
         }
-        Log.d(TAG, "CameraProvider and PreviewView are not null in bindCameraUseCases.")
-        
-        if (previewView?.surfaceProvider == null) {
-            Log.e(TAG, "SurfaceProvider is null in bindCameraUseCases. Waiting for it to be ready.")
-            previewView?.post {
-                if (previewView?.surfaceProvider != null) {
-                    Log.d(TAG, "SurfaceProvider is now ready in bindCameraUseCases (after post). Retrying bind.")
-                    bindCameraUseCases() // Retry binding once surface provider is ready
+        Log.i(TAG, "bindCameraUseCases: GLView instance: $glView, GLView.renderer: ${glView.renderer}")
+
+        val surfaceTexture = glView.getCameraSurfaceTexture() // This calls Log in CameraGLSurfaceView
+        Log.i(TAG, "bindCameraUseCases: SurfaceTexture from glView.getCameraSurfaceTexture(): $surfaceTexture")
+
+        if (surfaceTexture == null) {
+            Log.e(TAG, "bindCameraUseCases: SurfaceTexture from GLRenderer is NULL. GLSurfaceView might not be ready. Posting retry.")
+            // GLSurfaceView có thể chưa sẵn sàng. Thử lại sau một chút.
+            glView.post {
+                Log.i(TAG, "bindCameraUseCases: Retry block posted to glView. IsDisposed: $_isDisposed")
+                if (_isDisposed) {
+                    Log.w(TAG, "bindCameraUseCases: Retry: CameraManager is disposed. Aborting retry.")
+                    return@post
+                }
+                val currentSurfaceTextureInRetry = glView.getCameraSurfaceTexture()
+                Log.i(TAG, "bindCameraUseCases: Retrying bindCameraUseCases via glView.post. Current SurfaceTexture from view in retry: $currentSurfaceTextureInRetry")
+                if (currentSurfaceTextureInRetry != null) {
+                    bindCameraUseCases() // Recursive call, ensure it's safe
                 } else {
-                    Log.e(TAG, "SurfaceProvider is still null in bindCameraUseCases (after post).")
+                    Log.e(TAG, "bindCameraUseCases: Retry: SurfaceTexture is STILL NULL in retry. Not calling bindCameraUseCases again immediately.")
+                    // Consider a more robust retry mechanism if this happens frequently, e.g., with a delay or max attempts.
                 }
             }
+            Log.i(TAG, "bindCameraUseCases: Posted retry to glView. Returning for now.")
             return
         }
-        Log.d(TAG, "SurfaceProvider is available in bindCameraUseCases.")
+        Log.i(TAG, "bindCameraUseCases: SurfaceTexture obtained successfully: $surfaceTexture. Proceeding with binding.")
 
-        Log.d(TAG, "Binding camera use cases. Current filter: $currentFilterType, CameraSelector: $cameraSelector")
+        // Apply the current (possibly restored) filter type to the GLSurfaceView's renderer
+        // This ensures the renderer is up-to-date before the camera preview starts.
+        cameraGLSurfaceView?.setFilter(currentFilterType)
+        Log.i(TAG, "bindCameraUseCases: Applied filter '$currentFilterType' to GLSurfaceView renderer.")
+
+        Log.i(TAG, "bindCameraUseCases: Binding camera use cases. Current filter: $currentFilterType, CameraSelector: $cameraSelector, FlashMode: $currentFlashMode, Zoom: $currentZoomRatio")
         
         try {
-            Log.d(TAG, "Unbinding all previous use cases.") // Khôi phục lại dòng này
-            cameraProvider?.unbindAll() // Khôi phục lại dòng này
+            Log.i(TAG, "bindCameraUseCases: Unbinding all previous use cases before new bind.")
+            cameraProvider?.unbindAll()
+            Log.i(TAG, "bindCameraUseCases: Successfully unbound all previous use cases.")
 
-            Log.d(TAG, "Creating new Preview and ImageCapture use cases.")
-            preview = createPreviewUseCase()
+            preview = createPreviewUseCase(surfaceTexture)
             imageCapture = createImageCaptureUseCase()
+            Log.i(TAG, "bindCameraUseCases: Created new Preview and ImageCapture use cases. Preview: $preview, ImageCapture: $imageCapture")
 
-            Log.d(TAG, "Binding to lifecycle with LifecycleOwner: $lifecycleOwner")
             camera = cameraProvider?.bindToLifecycle(
                 lifecycleOwner,
                 cameraSelector,
                 preview,
                 imageCapture
             )
+            Log.i(TAG, "bindCameraUseCases: bindToLifecycle call completed. Camera object: $camera")
             
             if (camera != null) {
-                Log.d(TAG, "Camera use cases bound successfully to camera: ${camera?.cameraInfo?.implementationType}")
+                Log.i(TAG, "bindCameraUseCases: Camera use cases bound successfully to camera: ${camera?.cameraInfo?.implementationType}")
+                // Log available effects (vẫn hữu ích để biết khả năng của phần cứng)
+                try {
+                    val camera2CameraInfo = Camera2CameraInfo.from(camera!!.cameraInfo)
+                    val availableEffects = camera2CameraInfo.getCameraCharacteristic(CameraCharacteristics.CONTROL_AVAILABLE_EFFECTS)
+                    Log.d(TAG, "bindCameraUseCases: Available CONTROL_EFFECT_MODES (hardware): ${availableEffects?.joinToString { effect -> effectToString(effect) }}")
+                    
+                    val sensorRotation = camera!!.cameraInfo.sensorRotationDegrees
+                    val currentDisplayRotation = cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0
+                    lastKnownRotation = currentDisplayRotation
+                    
+                    Log.i(TAG, "bindCameraUseCases: Camera bound. SensorRotation: $sensorRotation, DisplayRotation: $currentDisplayRotation, PreviewSize: $targetResolution")
+
+                    cameraGLSurfaceView?.renderer?.setCameraParameters(
+                        targetResolution?.width ?: 0,
+                        targetResolution?.height ?: 0,
+                        sensorRotation,
+                        currentDisplayRotation
+                    )
+                    Log.i(TAG, "bindCameraUseCases: Called renderer.setCameraParameters.")
+
+                    // Apply initial zoom after camera is bound
+                    camera?.cameraControl?.setLinearZoom(currentZoomRatio)
+                    Log.i(TAG, "bindCameraUseCases: Applied initial zoom ratio: $currentZoomRatio")
+
+
+                } catch (e: Exception) {
+                    Log.e(TAG, "bindCameraUseCases: Error getting camera characteristics or setting params", e)
+                }
             } else {
-                Log.e(TAG, "Camera object is null after bindToLifecycle.")
+                Log.e(TAG, "bindCameraUseCases: Camera object is NULL after bindToLifecycle.")
             }
-            
-            // Ensure the surface provider is set
-            Log.d(TAG, "Setting surface provider for preview.")
-            preview?.setSurfaceProvider(previewView!!.surfaceProvider)
-            Log.d(TAG, "Surface provider set for preview. Requesting layout for PreviewView.")
-            previewView?.requestLayout() // Explicitly request layout
-            
+            // Không cần requestLayout cho GLSurfaceView ở đây
         } catch (exc: Exception) {
-            Log.e(TAG, "Use case binding failed", exc)
+            Log.e(TAG, "bindCameraUseCases: Use case binding failed with exception", exc)
+            // Consider invoking callback with error
         }
+        Log.i(TAG, "<<< bindCameraUseCases END. Camera: $camera")
     }
 
-    fun takePicture(photoFile: File, callback: (String?, String?) -> Unit) {
-        Log.d(TAG, "Taking picture requested to file: ${photoFile.absolutePath}")
+// Getters for current state
+fun getCurrentLensFacing(): Int {
+    return if (cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+}
+
+fun getCurrentZoomRatio(): Float {
+    // Try to get live value if camera is active, otherwise return stored
+    return camera?.cameraInfo?.zoomState?.value?.linearZoom ?: currentZoomRatio
+}
+
+fun getCurrentFlashMode(): String {
+    return when (currentFlashMode) {
+        ImageCapture.FLASH_MODE_ON -> "on"
+        ImageCapture.FLASH_MODE_AUTO -> "auto"
+        else -> "off"
+    }
+}
+
+fun getCurrentFilterType(): String {
+    return currentFilterType
+}
+
+
+fun takePicture(photoFile: File, callback: (String?, String?) -> Unit) {
+    Log.d(TAG, "Taking picture requested to file: ${photoFile.absolutePath}")
         
         // Check if imageCapture is initialized
         if (imageCapture == null) {
@@ -231,8 +374,8 @@ class CameraManager(
                     val filePath = savedUri.path
                     
                     // If a filter is active that requires post-processing
-                    if (currentFilterType != "none" && currentFilterType != "mono" && 
-                        currentFilterType != "negative" && currentFilterType != "solarize" && 
+                    if (currentFilterType != "none" &&
+                        currentFilterType != "negative" && currentFilterType != "solarize" &&
                         currentFilterType != "posterize") {
                         
                         // Perform post-processing on a background thread
@@ -352,54 +495,16 @@ class CameraManager(
     }
 
     fun setFilter(filterType: String) {
+        Log.d(TAG, "CameraManager setFilter called with: $filterType")
         this.currentFilterType = filterType.lowercase()
-        // Rebind use cases to apply the filter to the preview
-        bindCameraUseCases()
+        // Thông báo cho CameraGLSurfaceView (và renderer của nó) để thay đổi filter
+        cameraGLSurfaceView?.setFilter(this.currentFilterType)
+        // Không cần bindCameraUseCases() nữa vì filter được xử lý bởi OpenGL
     }
 
-    private fun applyEffectToPreview(
-        interop: androidx.camera.camera2.interop.Camera2Interop.Extender<*>, 
-        filterType: String
-    ) {
-        when (filterType.lowercase()) {
-            "grayscale", "mono" -> {
-                interop.setCaptureRequestOption(
-                    android.hardware.camera2.CaptureRequest.CONTROL_EFFECT_MODE, 
-                    android.hardware.camera2.CameraMetadata.CONTROL_EFFECT_MODE_MONO
-                )
-            }
-            "negative" -> {
-                interop.setCaptureRequestOption(
-                    android.hardware.camera2.CaptureRequest.CONTROL_EFFECT_MODE, 
-                    android.hardware.camera2.CameraMetadata.CONTROL_EFFECT_MODE_NEGATIVE
-                )
-            }
-            "solarize" -> {
-                interop.setCaptureRequestOption(
-                    android.hardware.camera2.CaptureRequest.CONTROL_EFFECT_MODE, 
-                    android.hardware.camera2.CameraMetadata.CONTROL_EFFECT_MODE_SOLARIZE
-                )
-            }
-            "posterize" -> {
-                interop.setCaptureRequestOption(
-                    android.hardware.camera2.CaptureRequest.CONTROL_EFFECT_MODE, 
-                    android.hardware.camera2.CameraMetadata.CONTROL_EFFECT_MODE_POSTERIZE
-                )
-            }
-            "sepia", "none" -> {
-                interop.setCaptureRequestOption(
-                    android.hardware.camera2.CaptureRequest.CONTROL_EFFECT_MODE,
-                    android.hardware.camera2.CameraMetadata.CONTROL_EFFECT_MODE_OFF
-                )
-            }
-            else -> { // Default case for any other filterType or if it's an unrecognized type
-                interop.setCaptureRequestOption(
-                    android.hardware.camera2.CaptureRequest.CONTROL_EFFECT_MODE,
-                    android.hardware.camera2.CameraMetadata.CONTROL_EFFECT_MODE_OFF
-                )
-            }
-        }
-    }
+    // Hàm applyEffectToPreview không còn cần thiết vì filter được xử lý bởi GLRenderer
+    // private fun applyEffectToPreview(...) { ... }
+
 
     fun switchCamera() {
         cameraSelector = if (cameraSelector == CameraSelector.DEFAULT_BACK_CAMERA) {
@@ -407,6 +512,7 @@ class CameraManager(
         } else {
             CameraSelector.DEFAULT_BACK_CAMERA
         }
+        // Cần rebind để sử dụng camera mới
         bindCameraUseCases()
     }
 
@@ -431,26 +537,15 @@ class CameraManager(
     }
 
     fun setZoom(zoomRatio: Float) {
-        camera?.cameraControl?.setLinearZoom(zoomRatio.coerceIn(0f, 1f))
+        val clampedZoom = zoomRatio.coerceIn(0f, 1f)
+        camera?.cameraControl?.setLinearZoom(clampedZoom)
+        currentZoomRatio = clampedZoom // Update stored zoom ratio
+        Log.d(TAG, "Set zoom to $clampedZoom. Stored currentZoomRatio: $currentZoomRatio")
     }
 
-    fun setPreviewView(view: PreviewView) {
-        Log.d(TAG, "setPreviewView called. New PreviewView: $view")
-        this.previewView = view
-        // If camera is already initialized, set surface provider. Otherwise, it will be set during init.
-        if (cameraProvider != null && preview != null) {
-            Log.d(TAG, "CameraProvider and Preview use case exist. Setting surface provider for new PreviewView.")
-            if (view.surfaceProvider != null) {
-                preview?.setSurfaceProvider(view.surfaceProvider)
-                Log.d(TAG, "Surface provider set for new PreviewView.")
-            } else {
-                Log.e(TAG, "New PreviewView's surfaceProvider is null in setPreviewView.")
-            }
-        } else {
-            Log.d(TAG, "CameraProvider or Preview use case is null in setPreviewView. Surface provider will be set during initialization or binding.")
-        }
-    }
-    
+    // Hàm setPreviewView(view: PreviewView) không còn cần thiết nữa
+    // Thay vào đó, CameraGLSurfaceView được truyền vào khi initializeCamera
+
     fun updateActivity(newActivity: Activity) {
         this.activity = newActivity
     }
@@ -460,31 +555,67 @@ class CameraManager(
     fun getActivity(): Activity = activity
 
     fun dispose() {
-        if (_isDisposed) return
+        Log.i(TAG, "dispose() called. Current state: _isDisposed=$_isDisposed")
+        if (_isDisposed) {
+            Log.d(TAG, "dispose() called but already disposed.")
+            return
+        }
         _isDisposed = true
+        Log.i(TAG, "dispose(): Set _isDisposed to true. Proceeding with resource cleanup.")
         try {
             // Clear pending capture requests
             if (pendingCaptureRequests.isNotEmpty()) {
-                Log.d(TAG, "Clearing ${pendingCaptureRequests.size} pending capture requests")
-                pendingCaptureRequests.forEach { 
+                Log.i(TAG, "Clearing ${pendingCaptureRequests.size} pending capture requests during dispose.")
+                pendingCaptureRequests.forEach {
                     it.callback(null, "Camera disposed while request was pending")
                 }
                 pendingCaptureRequests.clear()
             }
             
+            Log.d(TAG, "dispose(): Unbinding all camera use cases. CameraProvider: $cameraProvider")
             cameraProvider?.unbindAll()
-            cameraExecutor.shutdown()
-            // Cancel coroutines
+            Log.d(TAG, "dispose(): Shutting down cameraExecutor.")
+            cameraExecutor.shutdown() // Consider awaitTermination for clean shutdown
+            
+            Log.d(TAG, "dispose(): Cancelling coroutine scope.")
             (scope.coroutineContext[Job] as? Job)?.cancel()
-            previewView = null // Release reference to PreviewView
+            
+            Log.d(TAG, "dispose(): Nullifying references.")
+            // previewView = null // Không còn dùng previewView
+            cameraGLSurfaceView = null // Giải phóng tham chiếu đến GL view
             cameraProvider = null
             camera = null
             preview = null
             imageCapture = null
             isCaptureInProgress = false
-            Log.d(TAG, "CameraManager disposed.")
+            
+            Log.d(TAG, "dispose(): Disabling orientationEventListener.")
+            orientationEventListener?.disable()
+            orientationEventListener = null
+            Log.i(TAG, "CameraManager disposed successfully.")
         } catch (e: Exception) {
             Log.e(TAG, "Error during CameraManager disposal", e)
+        }
+    }
+
+    private fun updateUseCaseRotations(rotation: Int) {
+        // Update targetRotation for both Preview and ImageCapture
+        preview?.targetRotation = rotation
+        imageCapture?.targetRotation = rotation
+    }
+
+    private fun effectToString(effect: Int): String {
+        return when (effect) {
+            CameraMetadata.CONTROL_EFFECT_MODE_OFF -> "OFF ($effect)"
+            CameraMetadata.CONTROL_EFFECT_MODE_MONO -> "MONO ($effect)"
+            CameraMetadata.CONTROL_EFFECT_MODE_NEGATIVE -> "NEGATIVE ($effect)"
+            CameraMetadata.CONTROL_EFFECT_MODE_SOLARIZE -> "SOLARIZE ($effect)"
+            CameraMetadata.CONTROL_EFFECT_MODE_SEPIA -> "SEPIA ($effect)" // Mặc dù không dùng cho preview trực tiếp
+            CameraMetadata.CONTROL_EFFECT_MODE_POSTERIZE -> "POSTERIZE ($effect)"
+            CameraMetadata.CONTROL_EFFECT_MODE_WHITEBOARD -> "WHITEBOARD ($effect)"
+            CameraMetadata.CONTROL_EFFECT_MODE_BLACKBOARD -> "BLACKBOARD ($effect)"
+            CameraMetadata.CONTROL_EFFECT_MODE_AQUA -> "AQUA ($effect)"
+            else -> "UNKNOWN ($effect)"
         }
     }
 }
