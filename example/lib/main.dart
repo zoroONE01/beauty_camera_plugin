@@ -186,6 +186,7 @@ class _CameraScreenState extends State<CameraScreen>
       HapticFeedback.mediumImpact();
 
       final String? imagePath = await _cameraPlugin.takePicture();
+
       print(
         "Picture taken successfully at ${DateTime.now()}, path: $imagePath",
       );
@@ -227,32 +228,58 @@ class _CameraScreenState extends State<CameraScreen>
       context: context,
       builder:
           (context) => Dialog(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Padding(
-                  padding: const EdgeInsets.all(8.0),
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: Image.file(File(imagePath), fit: BoxFit.contain),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final screenHeight = MediaQuery.of(context).size.height;
+                final isLandscape =
+                    MediaQuery.of(context).orientation == Orientation.landscape;
+
+                // Giới hạn chiều cao cho landscape mode
+                final maxHeight =
+                    isLandscape ? screenHeight * 0.8 : screenHeight * 0.9;
+
+                return ConstrainedBox(
+                  constraints: BoxConstraints(maxHeight: maxHeight),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Image với Flexible để tránh overflow
+                      // Native đã xử lý tất cả rotation - image đã có orientation đúng
+                      Flexible(
+                        child: Padding(
+                          padding: const EdgeInsets.all(8.0),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: Image.file(
+                              File(imagePath),
+                              fit: BoxFit.contain,
+                            ),
+                          ),
+                        ),
+                      ),
+                      // ButtonBar với height cố định
+                      SizedBox(
+                        height: 48, // Height cố định cho ButtonBar
+                        child: ButtonBar(
+                          children: [
+                            TextButton(
+                              onPressed: () => Navigator.of(context).pop(),
+                              child: const Text('CLOSE'),
+                            ),
+                            TextButton(
+                              onPressed: () {
+                                // Share or save to gallery logic would go here
+                                Navigator.of(context).pop();
+                              },
+                              child: const Text('SAVE'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ),
-                ),
-                ButtonBar(
-                  children: [
-                    TextButton(
-                      onPressed: () => Navigator.of(context).pop(),
-                      child: const Text('CLOSE'),
-                    ),
-                    TextButton(
-                      onPressed: () {
-                        // Share or save to gallery logic would go here
-                        Navigator.of(context).pop();
-                      },
-                      child: const Text('SAVE'),
-                    ),
-                  ],
-                ),
-              ],
+                );
+              },
             ),
           ),
     );
@@ -337,6 +364,79 @@ class _CameraScreenState extends State<CameraScreen>
     }
   }
 
+  Widget _buildCaptureButton() {
+    return GestureDetector(
+      onTap:
+          _isCapturing
+              ? null
+              : () {
+                // Debounce to prevent rapid sequential taps
+                if (_isCapturing) return;
+
+                // Take the picture
+                _takePicture();
+
+                // Additional protection against rapid taps
+                setState(() {
+                  _isCapturing = true;
+                });
+
+                // Re-enable the button after a short delay even if
+                // the capture operation hasn't completed yet
+                // This helps in case the callback is never invoked due to a silent failure
+                Future.delayed(Duration(seconds: 10), () {
+                  if (mounted && _isCapturing) {
+                    print("Capture timeout - resetting capture state");
+                    setState(() {
+                      _isCapturing = false;
+                    });
+                  }
+                });
+              },
+      child: AnimatedContainer(
+        duration: Duration(milliseconds: 200),
+        width: _isCapturing ? 60 : 70,
+        height: _isCapturing ? 60 : 70,
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(_isCapturing ? 0.5 : 0.8),
+          shape: BoxShape.circle,
+          border: Border.all(
+            color: _isCapturing ? Colors.red : Colors.white,
+            width: 3,
+          ),
+        ),
+        child: Center(
+          child: AnimatedSwitcher(
+            duration: Duration(milliseconds: 300),
+            child:
+                _isCapturing
+                    ? Stack(
+                      key: ValueKey('capturing'),
+                      alignment: Alignment.center,
+                      children: [
+                        const CircularProgressIndicator(
+                          color: Colors.red,
+                          strokeWidth: 3,
+                        ),
+                        const Icon(
+                          Icons.camera_alt,
+                          color: Colors.black45,
+                          size: 24,
+                        ),
+                      ],
+                    )
+                    : const Icon(
+                      key: ValueKey('ready'),
+                      Icons.camera_alt,
+                      color: Colors.black,
+                      size: 32,
+                    ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -351,27 +451,20 @@ class _CameraScreenState extends State<CameraScreen>
       body: SafeArea(
         child: Stack(
           children: [
-            // Camera Preview using AndroidView (simpler approach for testing)
+            // Camera Preview - Full screen, let native handle orientation
             Positioned.fill(
               child: AndroidView(
                 viewType: 'com.example/camera_preview_view',
                 layoutDirection: TextDirection.ltr,
-                creationParams:
-                    const <
-                      String,
-                      dynamic
-                    >{}, // Keep empty or pass necessary params
+                creationParams: const <String, dynamic>{},
                 creationParamsCodec: const StandardMessageCodec(),
                 onPlatformViewCreated: (int id) {
-                  // This callback is when the native view is ready.
                   print("AndroidView (Platform view) created with id: $id");
                   setState(() {
                     _isViewCreated = true;
                   });
-                  // Initialize camera after view is created and permission is (hopefully) granted
                   _requestCameraPermissionAndInitialize();
                 },
-                // Optional: Add gesture recognizers if needed, but start simple
                 gestureRecognizers:
                     const <Factory<OneSequenceGestureRecognizer>>{},
               ),
@@ -414,25 +507,22 @@ class _CameraScreenState extends State<CameraScreen>
                 ),
               ),
 
-            // Filter selector panel (shown when filter button is tapped)
+            // Filter selector panel
             if (_showFilterSelector)
               Positioned(
                 bottom: 130,
                 left: 0,
                 right: 0,
                 child: Container(
-                  height: 100, // Increased height to prevent overflow
+                  height: 100,
                   decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(
-                      0.7,
-                    ), // Increased opacity for better visibility
+                    color: Colors.black.withOpacity(0.7),
                     borderRadius: BorderRadius.vertical(
                       top: Radius.circular(12),
                     ),
                   ),
                   child: Column(
                     children: [
-                      // Title
                       Padding(
                         padding: const EdgeInsets.only(top: 4.0, bottom: 2.0),
                         child: Text(
@@ -443,13 +533,12 @@ class _CameraScreenState extends State<CameraScreen>
                           ),
                         ),
                       ),
-                      // Filter buttons in scrollable row
                       Expanded(
                         child: ListView(
                           scrollDirection: Axis.horizontal,
                           padding: const EdgeInsets.symmetric(
                             horizontal: 12,
-                            vertical: 4, // Reduced vertical padding
+                            vertical: 4,
                           ),
                           children: [
                             FilterButton(
@@ -490,98 +579,19 @@ class _CameraScreenState extends State<CameraScreen>
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                   children: [
-                    // Filters button
                     IconButton(
                       icon: Icon(
                         Icons.filter_vintage,
                         color:
                             _showFilterSelector ? Colors.amber : Colors.white,
                       ),
-                      onPressed: () {
-                        setState(() {
-                          _showFilterSelector = !_showFilterSelector;
-                        });
-                      },
+                      onPressed:
+                          () => setState(
+                            () => _showFilterSelector = !_showFilterSelector,
+                          ),
                       tooltip: 'Filters',
                     ),
-
-                    // Capture button with double-tap protection
-                    GestureDetector(
-                      onTap:
-                          _isCapturing
-                              ? null
-                              : () {
-                                // Debounce to prevent rapid sequential taps
-                                if (_isCapturing) return;
-
-                                // Take the picture
-                                _takePicture();
-
-                                // Additional protection against rapid taps
-                                setState(() {
-                                  _isCapturing = true;
-                                });
-
-                                // Re-enable the button after a short delay even if
-                                // the capture operation hasn't completed yet
-                                // This helps in case the callback is never invoked due to a silent failure
-                                Future.delayed(Duration(seconds: 10), () {
-                                  if (mounted && _isCapturing) {
-                                    print(
-                                      "Capture timeout - resetting capture state",
-                                    );
-                                    setState(() {
-                                      _isCapturing = false;
-                                    });
-                                  }
-                                });
-                              },
-                      child: AnimatedContainer(
-                        duration: Duration(milliseconds: 200),
-                        width: _isCapturing ? 60 : 70,
-                        height: _isCapturing ? 60 : 70,
-                        decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(
-                            _isCapturing ? 0.5 : 0.8,
-                          ),
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: _isCapturing ? Colors.red : Colors.white,
-                            width: 3,
-                          ),
-                        ),
-                        child: Center(
-                          child: AnimatedSwitcher(
-                            duration: Duration(milliseconds: 300),
-                            child:
-                                _isCapturing
-                                    ? Stack(
-                                      key: ValueKey('capturing'),
-                                      alignment: Alignment.center,
-                                      children: [
-                                        const CircularProgressIndicator(
-                                          color: Colors.red,
-                                          strokeWidth: 3,
-                                        ),
-                                        const Icon(
-                                          Icons.camera_alt,
-                                          color: Colors.black45,
-                                          size: 24,
-                                        ),
-                                      ],
-                                    )
-                                    : const Icon(
-                                      key: ValueKey('ready'),
-                                      Icons.camera_alt,
-                                      color: Colors.black,
-                                      size: 32,
-                                    ),
-                          ),
-                        ),
-                      ),
-                    ),
-
-                    // Flash toggle
+                    _buildCaptureButton(),
                     IconButton(
                       icon: Icon(
                         _currentFlashMode == 'off'
@@ -605,7 +615,6 @@ class _CameraScreenState extends State<CameraScreen>
               right: 16,
               child: Column(
                 children: [
-                  // Camera switch button
                   Container(
                     decoration: BoxDecoration(
                       color: Colors.black.withOpacity(0.4),
@@ -620,10 +629,7 @@ class _CameraScreenState extends State<CameraScreen>
                       tooltip: 'Switch Camera',
                     ),
                   ),
-
                   const SizedBox(height: 16),
-
-                  // Zoom control
                   Container(
                     decoration: BoxDecoration(
                       color: Colors.black.withOpacity(0.4),

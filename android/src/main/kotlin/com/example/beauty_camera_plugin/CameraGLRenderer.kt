@@ -207,6 +207,16 @@ class CameraGLRenderer(
                 surfaceTexture?.updateTexImage()
                 surfaceTexture?.getTransformMatrix(stMatrix)
                 frameAvailable = false
+                
+                // DEBUG: Log stMatrix values để kiểm tra transformation
+                if (frameCounter % 120 == 0) { // Log mỗi 120 frames (2 giây ở 60fps)
+                    Log.d(TAG, "DEBUG_ORIENTATION: stMatrix values:")
+                    Log.d(TAG, "  [${stMatrix[0]}, ${stMatrix[1]}, ${stMatrix[2]}, ${stMatrix[3]}]")
+                    Log.d(TAG, "  [${stMatrix[4]}, ${stMatrix[5]}, ${stMatrix[6]}, ${stMatrix[7]}]")
+                    Log.d(TAG, "  [${stMatrix[8]}, ${stMatrix[9]}, ${stMatrix[10]}, ${stMatrix[11]}]")
+                    Log.d(TAG, "  [${stMatrix[12]}, ${stMatrix[13]}, ${stMatrix[14]}, ${stMatrix[15]}]")
+                    Log.d(TAG, "DEBUG_ORIENTATION: Camera params - SensorRot: $cameraSensorRotation, DisplayRot: $displayRotation")
+                }
             }
         }
 
@@ -334,7 +344,12 @@ class CameraGLRenderer(
     }
     
     fun setCameraParameters(previewWidth: Int, previewHeight: Int, sensorRot: Int, dispRot: Int) {
-        Log.d(TAG, "setCameraParameters. Preview: ${previewWidth}x${previewHeight}, SensorRot: $sensorRot, DisplayRot: $dispRot")
+        Log.d(TAG, "DEBUG_ORIENTATION: setCameraParameters called")
+        Log.d(TAG, "  Preview: ${previewWidth}x${previewHeight}")
+        Log.d(TAG, "  SensorRotation: $sensorRot degrees")
+        Log.d(TAG, "  DisplayRotation: $dispRot (Surface.ROTATION_*)")
+        Log.d(TAG, "  Previous values - SensorRot: $cameraSensorRotation, DisplayRot: $displayRotation")
+        
         textureWidth = previewWidth
         textureHeight = previewHeight
         cameraSensorRotation = sensorRot

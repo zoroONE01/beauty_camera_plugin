@@ -24,9 +24,9 @@ class MethodChannelBeautyCameraPlugin extends BeautyCameraPluginPlatform {
   Future<String?> takePicture() async {
     try {
       debugPrint('Sending takePicture request to native code');
-      final String? filePath = await methodChannel.invokeMethod<String>('takePicture');
-      debugPrint('Received response from takePicture: $filePath');
-      return filePath;
+      final String? result = await methodChannel.invokeMethod<String>('takePicture');
+      debugPrint('Received response from takePicture: $result');
+      return result;
     } catch (e) {
       debugPrint('Error during takePicture: $e');
       rethrow; // Propagate error to be handled in UI

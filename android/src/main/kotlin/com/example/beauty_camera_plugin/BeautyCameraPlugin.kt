@@ -110,6 +110,7 @@ class BeautyCameraPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                     cameraManager?.takePicture(photoFile) { filePath: String?, error: String? ->
                         if (filePath != null) {
                             Log.d(TAG, "Picture taken successfully: $filePath")
+                            // Native đã xử lý tất cả rotation - chỉ trả về image path
                             result.success(filePath)
                         } else {
                             Log.e(TAG, "Failed to take picture: $error")

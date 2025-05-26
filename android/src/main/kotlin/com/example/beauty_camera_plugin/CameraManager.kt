@@ -13,6 +13,7 @@ import android.util.Log
 import android.util.Size // Thêm import này
 import android.view.Surface
 import android.view.OrientationEventListener
+import androidx.exifinterface.media.ExifInterface
 import androidx.camera.camera2.interop.Camera2CameraInfo
 // import androidx.camera.camera2.interop.Camera2Interop // Không còn dùng cho preview filter
 import androidx.camera.core.*
@@ -100,6 +101,7 @@ class CameraManager(
 
     private var orientationEventListener: OrientationEventListener? = null
     private var lastKnownRotation: Int = Surface.ROTATION_0
+    private var currentDeviceOrientation: Int = 0 // Physical device orientation in degrees (0, 90, 180, 270)
     private var targetResolution: Size? = null // Để lưu kích thước mục tiêu cho preview
 
     fun initializeCamera(glView: CameraGLSurfaceView, callback: (Boolean, String?) -> Unit) {
@@ -136,29 +138,50 @@ class CameraManager(
         }, ContextCompat.getMainExecutor(context))
         Log.i(TAG, "initializeCamera: Added listener to cameraProviderFuture.")
 
-        // Setup orientation listener
+        // Setup orientation listener to track physical device orientation
+        // Even though screen is locked to portrait, we need to know physical orientation for photo capture
         if (orientationEventListener == null) {
             orientationEventListener = object : OrientationEventListener(context) {
                 override fun onOrientationChanged(orientation: Int) {
-                    val newDisplayRotation = cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0
-                    if (newDisplayRotation != lastKnownRotation) {
-                        lastKnownRotation = newDisplayRotation
-                        Log.d(TAG, "Device display rotation changed to: $newDisplayRotation")
-                        updateUseCaseRotations(newDisplayRotation)
+                    if (orientation == ORIENTATION_UNKNOWN) return
+                    
+                    // Convert raw orientation to discrete rotation values
+                    val newDeviceOrientation = when {
+                        orientation >= 315 || orientation < 45 -> 0      // Portrait
+                        orientation >= 45 && orientation < 135 -> 90     // Landscape left (rotated 90° CCW)
+                        orientation >= 135 && orientation < 225 -> 180   // Portrait upside down
+                        orientation >= 225 && orientation < 315 -> 270   // Landscape right (rotated 90° CW)
+                        else -> currentDeviceOrientation // Keep current if can't determine
+                    }
+                    
+                    if (newDeviceOrientation != currentDeviceOrientation) {
+                        Log.d(TAG, "DEBUG_ORIENTATION: Physical device orientation changed")
+                        Log.d(TAG, "  Raw orientation: $orientation degrees")
+                        Log.d(TAG, "  Old device orientation: $currentDeviceOrientation degrees")
+                        Log.d(TAG, "  New device orientation: $newDeviceOrientation degrees")
+                        Log.d(TAG, "  Screen remains LOCKED to portrait - preview unchanged")
                         
-                        // Thông báo cho GLRenderer về sự thay đổi hướng hiển thị
-                        // và các thông số camera khác nếu cần.
-                        val sensorRotation = camera?.cameraInfo?.sensorRotationDegrees ?: 0
-                        cameraGLSurfaceView?.renderer?.setCameraParameters(
-                            targetResolution?.width ?: 0,
-                            targetResolution?.height ?: 0,
-                            sensorRotation,
-                            newDisplayRotation
-                        )
+                        currentDeviceOrientation = newDeviceOrientation
+                        
+                        // Convert device orientation to Surface rotation for ImageCapture
+                        val surfaceRotation = when (newDeviceOrientation) {
+                            0 -> Surface.ROTATION_0
+                            90 -> Surface.ROTATION_90
+                            180 -> Surface.ROTATION_180
+                            270 -> Surface.ROTATION_270
+                            else -> Surface.ROTATION_0
+                        }
+                        
+                        updateUseCaseRotations(surfaceRotation)
+                        
+                        Log.d(TAG, "DEBUG_ORIENTATION: Updated ImageCapture rotation for device orientation $newDeviceOrientation°")
+                        Log.d(TAG, "  Preview stays portrait (always ROTATION_0)")
+                        Log.d(TAG, "  ImageCapture rotation: $surfaceRotation")
                     }
                 }
             }
             orientationEventListener?.enable()
+            Log.d(TAG, "DEBUG_ORIENTATION: OrientationEventListener enabled for physical device tracking")
         }
     }
 
@@ -168,19 +191,17 @@ class CameraManager(
         targetResolution = Size(1280, 720) // Ví dụ
         surfaceTexture.setDefaultBufferSize(targetResolution!!.width, targetResolution!!.height)
         
-        // Thông báo cho GLRenderer về kích thước preview và hướng ban đầu
-        // Lấy sensorRotation ở đây có thể chưa chính xác nếu camera chưa bind.
-        // Sẽ tốt hơn nếu cập nhật sau khi camera được bind.
-        // cameraGLSurfaceView?.renderer?.setCameraParameters(
-        //     targetResolution!!.width,
-        //     targetResolution!!.height,
-        //     0, // Tạm thời là 0, sẽ cập nhật sau khi bind
-        //     cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0
-        // )
-
+        // LOCK PREVIEW TO PORTRAIT: Always use ROTATION_0 for preview
+        // This keeps camera preview in portrait orientation regardless of device rotation
+        val previewTargetRotation = Surface.ROTATION_0 // Always portrait for preview
+        Log.d(TAG, "DEBUG_ORIENTATION: createPreviewUseCase")
+        Log.d(TAG, "  Preview targetRotation: $previewTargetRotation (LOCKED TO PORTRAIT)")
+        Log.d(TAG, "  Device rotation: ${cameraGLSurfaceView?.display?.rotation}")
+        Log.d(TAG, "  Preview targetResolution: ${targetResolution!!.width}x${targetResolution!!.height}")
+        
         return Preview.Builder()
             .setTargetResolution(targetResolution!!) // Đặt kích thước mục tiêu
-            .setTargetRotation(cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0) // Quan trọng: CameraX sẽ cố gắng cung cấp frame đã xoay
+            .setTargetRotation(previewTargetRotation) // ALWAYS PORTRAIT cho preview
             .build()
             .also {
                 // Không dùng setSurfaceProvider với PreviewView nữa
@@ -192,13 +213,18 @@ class CameraManager(
                         surface.release() // Quan trọng: giải phóng surface khi không dùng nữa
                     }
                 }
-                Log.d(TAG, "Preview use case created with SurfaceTexture target.")
+                Log.d(TAG, "Preview use case created with SurfaceTexture target (PORTRAIT LOCKED).")
             }
     }
 
     private fun createImageCaptureUseCase(): ImageCapture {
+        val targetRotation = cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0
+        Log.d(TAG, "DEBUG_ORIENTATION: createImageCaptureUseCase")
+        Log.d(TAG, "  ImageCapture targetRotation: $targetRotation")
+        Log.d(TAG, "  FlashMode: $currentFlashMode")
+        
         return ImageCapture.Builder()
-            .setTargetRotation(cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0)
+            .setTargetRotation(targetRotation)
             .setFlashMode(currentFlashMode) // Apply current flash mode
             .build()
     }
@@ -335,6 +361,10 @@ fun getCurrentFilterType(): String {
     return currentFilterType
 }
 
+fun getCurrentDeviceOrientation(): Int {
+    return currentDeviceOrientation
+}
+
 
 fun takePicture(photoFile: File, callback: (String?, String?) -> Unit) {
     Log.d(TAG, "Taking picture requested to file: ${photoFile.absolutePath}")
@@ -368,38 +398,67 @@ fun takePicture(photoFile: File, callback: (String?, String?) -> Unit) {
             ContextCompat.getMainExecutor(context),
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                    Log.d(TAG, "Image capture successful, processing result")
+                    Log.d(TAG, "DEBUG_ORIENTATION: Image capture successful, analyzing orientation")
                     
                     val savedUri = outputFileResults.savedUri ?: Uri.fromFile(photoFile)
                     val filePath = savedUri.path
                     
-                    // If a filter is active that requires post-processing
-                    if (currentFilterType != "none" &&
-                        currentFilterType != "negative" && currentFilterType != "solarize" &&
-                        currentFilterType != "posterize") {
+                    // DEBUG: Kiểm tra EXIF orientation data
+                    try {
+                        val exif = ExifInterface(photoFile.absolutePath)
+                        val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+                        val orientationString = when(orientation) {
+                            ExifInterface.ORIENTATION_NORMAL -> "NORMAL (0°)"
+                            ExifInterface.ORIENTATION_ROTATE_90 -> "ROTATE_90 (90°)"
+                            ExifInterface.ORIENTATION_ROTATE_180 -> "ROTATE_180 (180°)"
+                            ExifInterface.ORIENTATION_ROTATE_270 -> "ROTATE_270 (270°)"
+                            else -> "OTHER ($orientation)"
+                        }
+                        Log.d(TAG, "DEBUG_ORIENTATION: Captured image EXIF orientation: $orientationString")
+                        Log.d(TAG, "DEBUG_ORIENTATION: File: ${photoFile.absolutePath}")
                         
-                        // Perform post-processing on a background thread
-                        scope.launch(Dispatchers.IO) {
-                            try {
+                        // So sánh với current camera state
+                        val currentDisplayRotation = cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0
+                        val sensorRotation = camera?.cameraInfo?.sensorRotationDegrees ?: 0
+                        Log.d(TAG, "DEBUG_ORIENTATION: Current camera state at capture time:")
+                        Log.d(TAG, "  Display rotation: $currentDisplayRotation")
+                        Log.d(TAG, "  Sensor rotation: $sensorRotation°")
+                        Log.d(TAG, "  Preview targetRotation: ${preview?.targetRotation}")
+                        Log.d(TAG, "  ImageCapture targetRotation: ${imageCapture?.targetRotation}")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "DEBUG_ORIENTATION: Error reading EXIF data", e)
+                    }
+                    
+                    // Always apply orientation correction and optional filter on background thread
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            Log.d(TAG, "DEBUG_ORIENTATION: Post-processing captured image")
+                            
+                            // Step 1: Apply orientation correction
+                            val sensorRotation = camera?.cameraInfo?.sensorRotationDegrees ?: 0
+                            val targetRotation = imageCapture?.targetRotation ?: Surface.ROTATION_0
+                            applyCapturedImageCorrection(photoFile.absolutePath, sensorRotation, targetRotation)
+                            
+                            // Step 2: Apply filter if needed
+                            if (currentFilterType != "none" &&
+                                currentFilterType != "negative" && currentFilterType != "solarize" &&
+                                currentFilterType != "posterize") {
                                 Log.d(TAG, "Applying filter to captured image: $currentFilterType")
                                 applyFilterToSavedImage(photoFile.absolutePath, currentFilterType)
-                                launch(Dispatchers.Main) {
-                                    // Notify caller of success on main thread
-                                    callback(photoFile.absolutePath, null)
-                                    processNextCaptureRequest()
-                                }
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to apply filter to image", e)
-                                launch(Dispatchers.Main) {
-                                    callback(null, "Failed to apply filter: ${e.message}")
-                                    processNextCaptureRequest()
-                                }
+                            }
+                            
+                            launch(Dispatchers.Main) {
+                                // Notify caller of success on main thread
+                                callback(photoFile.absolutePath, null)
+                                processNextCaptureRequest()
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to post-process captured image", e)
+                            launch(Dispatchers.Main) {
+                                callback(null, "Failed to process image: ${e.message}")
+                                processNextCaptureRequest()
                             }
                         }
-                    } else {
-                        // No post-processing needed
-                        callback(filePath, null)
-                        processNextCaptureRequest()
                     }
                 }
                 
@@ -426,6 +485,110 @@ fun takePicture(photoFile: File, callback: (String?, String?) -> Unit) {
         } else {
             // No more pending requests
             isCaptureInProgress = false
+        }
+    }
+
+    private fun applyCapturedImageCorrection(filePath: String, sensorRotation: Int, targetRotation: Int) {
+        Log.d(TAG, "DEBUG_ORIENTATION: applyCapturedImageCorrection")
+        Log.d(TAG, "  SensorRotation: $sensorRotation°")
+        Log.d(TAG, "  TargetRotation: $targetRotation")
+        
+        // Calculate rotation based on physical device orientation (not display rotation)
+        // Since screen is locked to portrait, we use currentDeviceOrientation for proper image rotation
+        val deviceOrientationRotation = when (currentDeviceOrientation) {
+            0 -> Surface.ROTATION_0      // Portrait
+            90 -> Surface.ROTATION_90    // Landscape left
+            180 -> Surface.ROTATION_180  // Portrait upside down
+            270 -> Surface.ROTATION_270  // Landscape right
+            else -> Surface.ROTATION_0   // Default to portrait
+        }
+        
+        val requiredRotation = when {
+            sensorRotation == 90 && deviceOrientationRotation == Surface.ROTATION_0 -> 90f   // Portrait
+            sensorRotation == 90 && deviceOrientationRotation == Surface.ROTATION_90 -> 0f   // Landscape left
+            sensorRotation == 90 && deviceOrientationRotation == Surface.ROTATION_180 -> -90f // Portrait upside down
+            sensorRotation == 90 && deviceOrientationRotation == Surface.ROTATION_270 -> 180f // Landscape right
+            sensorRotation == 270 && deviceOrientationRotation == Surface.ROTATION_0 -> -90f  // Front camera portrait
+            sensorRotation == 270 && deviceOrientationRotation == Surface.ROTATION_90 -> 0f   // Front camera landscape left
+            sensorRotation == 270 && deviceOrientationRotation == Surface.ROTATION_180 -> 90f // Front camera upside down
+            sensorRotation == 270 && deviceOrientationRotation == Surface.ROTATION_270 -> 180f // Front camera landscape right
+            else -> 0f // No rotation needed for sensorRotation 0° or 180°
+        }
+        
+        Log.d(TAG, "DEBUG_ORIENTATION: Using physical device orientation for image correction")
+        Log.d(TAG, "  Physical device orientation: $currentDeviceOrientation°")
+        Log.d(TAG, "  Converted to Surface rotation: $deviceOrientationRotation")
+        Log.d(TAG, "  Sensor rotation: $sensorRotation°")
+        Log.d(TAG, "  Required bitmap rotation: $requiredRotation°")
+        
+        Log.d(TAG, "DEBUG_ORIENTATION: Calculated required rotation: $requiredRotation°")
+        
+        if (requiredRotation != 0f) {
+            try {
+                // Load the bitmap
+                val originalBitmap = BitmapFactory.decodeFile(filePath)
+                if (originalBitmap == null) {
+                    Log.e(TAG, "Failed to decode bitmap from file: $filePath")
+                    return
+                }
+                
+                // Create rotation matrix
+                val matrix = Matrix().apply {
+                    postRotate(requiredRotation)
+                }
+                
+                // Calculate new dimensions after rotation to prevent overflow
+                val originalWidth = originalBitmap.width
+                val originalHeight = originalBitmap.height
+                
+                // For 90° or 270° rotations, width and height are swapped
+                val willSwapDimensions = (requiredRotation % 180f != 0f)
+                val newWidth = if (willSwapDimensions) originalHeight else originalWidth
+                val newHeight = if (willSwapDimensions) originalWidth else originalHeight
+                
+                Log.d(TAG, "DEBUG_ORIENTATION: Bitmap rotation details:")
+                Log.d(TAG, "  Original: ${originalWidth}x${originalHeight}")
+                Log.d(TAG, "  Rotation: $requiredRotation°")
+                Log.d(TAG, "  Will swap dimensions: $willSwapDimensions")
+                Log.d(TAG, "  Expected new size: ${newWidth}x${newHeight}")
+                
+                // Apply rotation with proper matrix centering
+                val rotatedBitmap = Bitmap.createBitmap(
+                    originalBitmap,
+                    0, 0,
+                    originalWidth,
+                    originalHeight,
+                    matrix,
+                    true
+                )
+                
+                Log.d(TAG, "DEBUG_ORIENTATION: Actual rotated bitmap size: ${rotatedBitmap.width}x${rotatedBitmap.height}")
+                
+                // Save the rotated bitmap back to file
+                val outputStream = FileOutputStream(filePath)
+                rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
+                outputStream.flush()
+                outputStream.close()
+                
+                // Update EXIF to normal orientation since we've physically rotated the image
+                val exif = ExifInterface(filePath)
+                exif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
+                exif.saveAttributes()
+                
+                // Clean up bitmaps
+                originalBitmap.recycle()
+                if (rotatedBitmap != originalBitmap) {
+                    rotatedBitmap.recycle()
+                }
+                
+                Log.d(TAG, "DEBUG_ORIENTATION: Successfully applied rotation $requiredRotation° and updated EXIF")
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "DEBUG_ORIENTATION: Error applying image correction", e)
+                throw e
+            }
+        } else {
+            Log.d(TAG, "DEBUG_ORIENTATION: No rotation correction needed")
         }
     }
 
@@ -599,9 +762,23 @@ fun takePicture(photoFile: File, callback: (String?, String?) -> Unit) {
     }
 
     private fun updateUseCaseRotations(rotation: Int) {
-        // Update targetRotation for both Preview and ImageCapture
-        preview?.targetRotation = rotation
+        Log.d(TAG, "DEBUG_ORIENTATION: updateUseCaseRotations called")
+        Log.d(TAG, "  New device rotation: $rotation")
+        Log.d(TAG, "  Previous Preview targetRotation: ${preview?.targetRotation}")
+        Log.d(TAG, "  Previous ImageCapture targetRotation: ${imageCapture?.targetRotation}")
+        
+        // CAMERA APP BEHAVIOR:
+        // - Preview ALWAYS stays portrait (ROTATION_0)
+        // - Only ImageCapture rotation changes to follow device orientation
+        
+        // DON'T update preview rotation - keep it portrait
+        // preview?.targetRotation = Surface.ROTATION_0 // Keep preview portrait
+        
+        // ONLY update ImageCapture rotation to follow device orientation
         imageCapture?.targetRotation = rotation
+        
+        Log.d(TAG, "  Preview targetRotation: ${preview?.targetRotation} (KEPT PORTRAIT)")
+        Log.d(TAG, "  Updated ImageCapture targetRotation: ${imageCapture?.targetRotation}")
     }
 
     private fun effectToString(effect: Int): String {
