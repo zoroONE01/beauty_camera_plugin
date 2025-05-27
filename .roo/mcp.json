@@ -21,7 +21,7 @@
       "args": [
         "-y",
         "@modelcontextprotocol/server-filesystem",
-        "/Users/tuthanhnguyen/GMO/beauty_camera_plugin"
+        "/Users/tunt/Workspace/Flutter/beauty_camera_plugin"
       ]
     }
   }
