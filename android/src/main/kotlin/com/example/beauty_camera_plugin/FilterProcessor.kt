@@ -10,22 +10,27 @@ object FilterProcessor {
     private const val TAG = "FilterProcessor"
 
     fun applySepia(inputBitmap: Bitmap, intensity: Float): Bitmap {
-        return applyColorMatrixToBitmap(inputBitmap, getSepiaMatrix(intensity))
+        Log.d(TAG, "applySepia called with intensity: $intensity")
+        return applyColorMatrixToBitmap(inputBitmap, getSepiaMatrix(intensity), "applySepia")
     }
 
     fun applyVintage(inputBitmap: Bitmap, intensity: Float): Bitmap {
-        return applyColorMatrixToBitmap(inputBitmap, getVintageMatrix(intensity))
+        Log.d(TAG, "applyVintage called with intensity: $intensity")
+        return applyColorMatrixToBitmap(inputBitmap, getVintageMatrix(intensity), "applyVintage")
     }
 
     fun applyCool(inputBitmap: Bitmap, intensity: Float): Bitmap {
-        return applyColorMatrixToBitmap(inputBitmap, getCoolMatrix(intensity))
+        Log.d(TAG, "applyCool called with intensity: $intensity")
+        return applyColorMatrixToBitmap(inputBitmap, getCoolMatrix(intensity), "applyCool")
     }
 
     fun applyWarm(inputBitmap: Bitmap, intensity: Float): Bitmap {
-        return applyColorMatrixToBitmap(inputBitmap, getWarmMatrix(intensity))
+        Log.d(TAG, "applyWarm called with intensity: $intensity")
+        return applyColorMatrixToBitmap(inputBitmap, getWarmMatrix(intensity), "applyWarm")
     }
 
     fun applyBlur(inputBitmap: Bitmap, intensity: Float): Bitmap {
+        Log.d(TAG, "applyBlur called with intensity: $intensity")
         return try {
             // Note: The original saveBitmap and recycle logic is removed as this function
             // now returns the bitmap for further processing or display.
@@ -38,6 +43,7 @@ object FilterProcessor {
     }
 
     fun applySharpen(inputBitmap: Bitmap, intensity: Float): Bitmap {
+        Log.d(TAG, "applySharpen called with intensity: $intensity")
         return try {
             applySharpenFilter(inputBitmap, intensity)
         } catch (e: Exception) {
@@ -47,6 +53,7 @@ object FilterProcessor {
     }
 
     fun applyEdge(inputBitmap: Bitmap, intensity: Float): Bitmap {
+        Log.d(TAG, "applyEdge called with intensity: $intensity")
         return try {
             applyEdgeDetection(inputBitmap, intensity)
         } catch (e: Exception) {
@@ -56,6 +63,7 @@ object FilterProcessor {
     }
 
     fun applyVignette(inputBitmap: Bitmap, intensity: Float): Bitmap {
+        Log.d(TAG, "applyVignette called with intensity: $intensity")
         return try {
             applyVignetteEffect(inputBitmap, intensity)
         } catch (e: Exception) {
@@ -64,16 +72,28 @@ object FilterProcessor {
         }
     }
 
+fun applyMono(inputBitmap: Bitmap, intensity: Float): Bitmap {
+        Log.d(TAG, "applyMono called with intensity: $intensity")
+        return applyColorMatrixToBitmap(inputBitmap, getMonoMatrix(intensity), "applyMono")
+    }
+
+    fun applyNegative(inputBitmap: Bitmap, intensity: Float): Bitmap {
+        Log.d(TAG, "applyNegative called with intensity: $intensity")
+        return applyColorMatrixToBitmap(inputBitmap, getNegativeMatrix(intensity), "applyNegative")
+    }
     fun applyContrast(inputBitmap: Bitmap, intensity: Float): Bitmap {
-        return applyColorMatrixToBitmap(inputBitmap, getContrastMatrix(intensity))
+        Log.d(TAG, "applyContrast called with intensity: $intensity")
+        return applyColorMatrixToBitmap(inputBitmap, getContrastMatrix(intensity), "applyContrast")
     }
 
     fun applyBrightness(inputBitmap: Bitmap, intensity: Float): Bitmap {
-        return applyColorMatrixToBitmap(inputBitmap, getBrightnessMatrix(intensity))
+        Log.d(TAG, "applyBrightness called with intensity: $intensity")
+        return applyColorMatrixToBitmap(inputBitmap, getBrightnessMatrix(intensity), "applyBrightness")
     }
 
     // Renamed from applyColorMatrixFilter and modified to work with Bitmaps
-    private fun applyColorMatrixToBitmap(inputBitmap: Bitmap, colorMatrix: ColorMatrix): Bitmap {
+    private fun applyColorMatrixToBitmap(inputBitmap: Bitmap, colorMatrix: ColorMatrix, filterName: String): Bitmap {
+        Log.d(TAG, "applyColorMatrixToBitmap called for filter: $filterName")
         return try {
             // The applyColorMatrix internal function already returns a new Bitmap
             // and does not modify the inputBitmap.
@@ -326,6 +346,45 @@ object FilterProcessor {
             0f, 0f, 0f, 1f, 0f
         ))
         return brightnessMatrix
+    }
+
+private fun getMonoMatrix(intensity: Float): ColorMatrix {
+        val matrix = ColorMatrix()
+        val r = 0.299f
+        val g = 0.587f
+        val b = 0.114f
+        matrix.set(floatArrayOf(
+            r, g, b, 0f, 0f,
+            r, g, b, 0f, 0f,
+            r, g, b, 0f, 0f,
+            0f, 0f, 0f, 1f, 0f
+        ))
+        // Lerp between identity and full monochrome based on intensity
+        val identity = ColorMatrix() // Default is identity matrix
+        val resultMatrix = ColorMatrix()
+        for (i in 0..19) {
+            resultMatrix.getArray()[i] = (1 - intensity) * identity.getArray()[i] + intensity * matrix.getArray()[i]
+        }
+        return resultMatrix
+    }
+
+    private fun getNegativeMatrix(intensity: Float): ColorMatrix {
+        val matrix = ColorMatrix()
+        matrix.set(floatArrayOf(
+            -1f, 0f, 0f, 0f, 255f,
+            0f, -1f, 0f, 0f, 255f,
+            0f, 0f, -1f, 0f, 255f,
+            0f, 0f, 0f, 1f, 0f
+        ))
+        // Lerp between identity and full negative based on intensity
+        val identity = ColorMatrix() // Default is identity matrix
+        val resultMatrix = ColorMatrix()
+        for (i in 0..19) {
+            resultMatrix.getArray()[i] = (1 - intensity) * identity.getArray()[i] + intensity * matrix.getArray()[i]
+        }
+        // Ensure alpha is not inverted if it's part of the lerp
+        resultMatrix.getArray()[18] = 1f
+        return resultMatrix
     }
 
     private fun saveBitmap(bitmap: Bitmap, filePath: String) {

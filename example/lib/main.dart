@@ -1092,7 +1092,7 @@ class FilterButton extends StatelessWidget {
       case CameraFilter.sepia:
         iconData = Icons.palette_outlined;
         break;
-      case CameraFilter.grayscale:
+      case CameraFilter.mono:
         iconData = Icons.monochrome_photos_outlined;
         break;
       case CameraFilter.negative:

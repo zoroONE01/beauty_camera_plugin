@@ -10,7 +10,7 @@ enum CameraFilter {
   // Basic filters
   none('none', 'None', 'No filter applied'),
   sepia('sepia', 'Sepia', 'Vintage sepia tone effect'),
-  grayscale('grayscale', 'Mono', 'Black and white conversion'),
+  mono('mono', 'Mono', 'Black and white conversion'),
   negative('negative', 'Negative', 'Color inversion effect'),
   vintage('vintage', 'Vintage', 'Nostalgic film effect'),
   cool('cool', 'Cool', 'Cool temperature adjustment'),
@@ -49,7 +49,7 @@ enum CameraFilter {
   static List<CameraFilter> get availableFilters => [
     CameraFilter.none,
     CameraFilter.sepia,
-    CameraFilter.grayscale,
+    CameraFilter.mono,
     CameraFilter.negative,
     CameraFilter.vintage,
     CameraFilter.cool,
@@ -66,7 +66,7 @@ enum CameraFilter {
   static List<CameraFilter> get basicFilters => [
     CameraFilter.none,
     CameraFilter.sepia,
-    CameraFilter.grayscale,
+    CameraFilter.mono,
     CameraFilter.negative,
     CameraFilter.vintage,
     CameraFilter.cool,

@@ -280,35 +280,31 @@ class CameraManager(private val activity: Activity) {
 
                 if (currentFilterType != "none") {
                     // Only apply custom filters here. Camera2 native effects are on Preview use case.
-                    if (currentFilterType !in listOf("grayscale", "mono", "negative", "solarize", "posterize")) {
-                        filterAppliedThisFrame = true
-                        processedBitmap = when (currentFilterType.lowercase()) {
-                            "sepia" -> FilterProcessor.applySepia(bitmapToProcess, currentFilterIntensity)
-                            "vintage" -> FilterProcessor.applyVintage(bitmapToProcess, currentFilterIntensity)
-                            "cool" -> FilterProcessor.applyCool(bitmapToProcess, currentFilterIntensity)
-                            "warm" -> FilterProcessor.applyWarm(bitmapToProcess, currentFilterIntensity)
-                            "blur" -> FilterProcessor.applyBlur(bitmapToProcess, currentFilterIntensity)
-                            "sharpen" -> FilterProcessor.applySharpen(bitmapToProcess, currentFilterIntensity)
-                            "edge" -> FilterProcessor.applyEdge(bitmapToProcess, currentFilterIntensity)
-                            "vignette" -> FilterProcessor.applyVignette(bitmapToProcess, currentFilterIntensity)
-                            "contrast" -> FilterProcessor.applyContrast(bitmapToProcess, currentFilterIntensity)
-                            "brightness" -> FilterProcessor.applyBrightness(bitmapToProcess, currentFilterIntensity)
-                            else -> { // Should not happen if check above is correct
-                                filterAppliedThisFrame = false
-                                bitmapToProcess
+                    // Apply custom filters here. Camera2 native effects are on Preview use case.
+                    // We will now apply mono and negative here as well for consistency if FilteredTextureView is used.
+                    filterAppliedThisFrame = true
+                    processedBitmap = when (currentFilterType.lowercase()) {
+                        "sepia" -> FilterProcessor.applySepia(bitmapToProcess, currentFilterIntensity)
+                        "vintage" -> FilterProcessor.applyVintage(bitmapToProcess, currentFilterIntensity)
+                        "cool" -> FilterProcessor.applyCool(bitmapToProcess, currentFilterIntensity)
+                        "warm" -> FilterProcessor.applyWarm(bitmapToProcess, currentFilterIntensity)
+                        "blur" -> FilterProcessor.applyBlur(bitmapToProcess, currentFilterIntensity)
+                        "sharpen" -> FilterProcessor.applySharpen(bitmapToProcess, currentFilterIntensity)
+                        "edge" -> FilterProcessor.applyEdge(bitmapToProcess, currentFilterIntensity)
+                        "vignette" -> FilterProcessor.applyVignette(bitmapToProcess, currentFilterIntensity)
+                        "contrast" -> FilterProcessor.applyContrast(bitmapToProcess, currentFilterIntensity)
+                        "brightness" -> FilterProcessor.applyBrightness(bitmapToProcess, currentFilterIntensity)
+                        "mono", "grayscale" -> FilterProcessor.applyMono(bitmapToProcess, currentFilterIntensity) // Added mono/grayscale
+                        "negative" -> FilterProcessor.applyNegative(bitmapToProcess, currentFilterIntensity) // Added negative
+                        else -> {
+                            // If filterType is "none" or a Camera2 native effect like "solarize", "posterize"
+                            // that we don't handle with FilterProcessor for ImageAnalysis.
+                            if (currentFilterType !in listOf("none", "solarize", "posterize")) {
+                                Log.w(TAG, "BitmapProcessor: Unhandled custom filter type '$currentFilterType' in when. Using original.")
                             }
+                            filterAppliedThisFrame = false
+                            bitmapToProcess
                         }
-                    } else {
-                        // For Camera2 native effect types, we don't re-apply them in ImageAnalysis for debug saving.
-                        // We just save the rotated frame.
-                        // If you want to see these effects in saved debug frames, you'd need to
-                        // replicate their logic from FilterProcessor or use a different approach.
-                        // For now, we treat them as "no custom filter applied in ImageAnalysis".
-                        processedBitmap = bitmapToProcess // Use the rotated bitmap directly
-                        // To still save these frames for rotation check, we can set filterAppliedThisFrame to true
-                        // if we want to save them, or handle saving outside the `if (filterAppliedThisFrame)` block.
-                        // Let's assume for now we only save if a *custom* filter from FilterProcessor was run.
-                        // If you want to save all frames passing through, adjust the logic.
                     }
                 }
 
@@ -654,6 +650,8 @@ class CameraManager(private val activity: Activity) {
             "vignette" -> FilterProcessor.applyVignette(originalBitmap, intensity)
             "contrast" -> FilterProcessor.applyContrast(originalBitmap, intensity)
             "brightness" -> FilterProcessor.applyBrightness(originalBitmap, intensity)
+            "mono", "grayscale" -> FilterProcessor.applyMono(originalBitmap, intensity) // Added mono/grayscale
+            "negative" -> FilterProcessor.applyNegative(originalBitmap, intensity) // Added negative
             else -> originalBitmap // If filter type is unknown or "none", return original
         }
 
