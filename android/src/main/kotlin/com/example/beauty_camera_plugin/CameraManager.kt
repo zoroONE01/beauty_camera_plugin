@@ -86,10 +86,10 @@ class CameraManager(private val activity: Activity) {
     fun setFilteredTextureView(view: FilteredTextureView) {
         this.filteredTextureView = view
         // Update its orientation immediately if we already have a target rotation
-        currentTargetRotation?.let { surfaceRotation ->
-            val degrees = degreesFromSurfaceRotation(surfaceRotation)
-            view.updateDisplayOrientation(degrees)
-        }
+        // currentTargetRotation?.let { surfaceRotation -> // REMOVED - FTV no longer needs display orientation
+        //     val degrees = degreesFromSurfaceRotation(surfaceRotation)
+        //     view.updateDisplayOrientation(degrees)
+        // }
         // Only start camera if cameraProvider is already initialized
         if (cameraProvider != null) {
             startCamera()
@@ -736,55 +736,53 @@ class CameraManager(private val activity: Activity) {
     fun updateTargetRotation(rotation: Int) { // rotation is Surface.ROTATION_*
         Log.e(TAG, "updateTargetRotation CALLED. New SurfaceRotation: $rotation, Old: ${currentTargetRotation ?: "null"}")
         if (currentTargetRotation == rotation && camera != null) {
-            Log.e(TAG, "updateTargetRotation: Rotation unchanged ($rotation) and camera active. Attempting to update FTV orientation anyway.")
-            // Even if rotation is same, ensure FTV is updated, in case it missed a previous update.
-            filteredTextureView?.let {
-                val degrees = degreesFromSurfaceRotation(rotation)
-                it.updateDisplayOrientation(degrees) // This will log inside FTV
-            }
+            Log.d(TAG, "updateTargetRotation: Rotation unchanged ($rotation). No action needed.") // Changed Log.e to Log.d
+            // filteredTextureView?.let { // REMOVED - FTV no longer needs display orientation
+            //     val degrees = degreesFromSurfaceRotation(rotation)
+            //     it.updateDisplayOrientation(degrees)
+            // }
             return
         }
         
         this.currentTargetRotation = rotation
-        Log.e(TAG, "updateTargetRotation: currentTargetRotation (Surface rotation) updated to: $currentTargetRotation")
+        Log.d(TAG, "updateTargetRotation: currentTargetRotation (Surface rotation) updated to: $currentTargetRotation") // Changed Log.e to Log.d
 
         // Revert to calling startCamera() to ensure ImageAnalysis use case is reconfigured
         // with the new targetRotation, which affects image.imageInfo.rotationDegrees.
         if (cameraProvider != null && activity != null) {
-            Log.e(TAG, "updateTargetRotation: Calling startCamera() due to rotation change.")
+            Log.d(TAG, "updateTargetRotation: Calling startCamera() due to rotation change.") // Changed Log.e to Log.d
             startCamera() // This will rebind use cases with the new currentTargetRotation
-            Log.e(TAG, "updateTargetRotation: startCamera() CALL COMPLETE.")
+            Log.d(TAG, "updateTargetRotation: startCamera() CALL COMPLETE.") // Changed Log.e to Log.d
         } else {
             Log.e(TAG, "updateTargetRotation: CANNOT call startCamera(). cameraProvider: $cameraProvider, activity: $activity")
-            // If we can't restart camera, at least try to update the view's orientation
-            // This might lead to incorrect bitmap rotation if ImageAnalysis isn't updated.
-            filteredTextureView?.let {
-                val degrees = degreesFromSurfaceRotation(rotation)
-                it.updateDisplayOrientation(degrees)
-                Log.e(TAG, "updateTargetRotation: Updated FTV orientation directly as camera could not be restarted.")
-            }
+            // If we can't restart camera, no FTV update is needed here as it doesn't handle orientation anymore
+            // filteredTextureView?.let { // REMOVED
+            //     val degrees = degreesFromSurfaceRotation(rotation)
+            //     it.updateDisplayOrientation(degrees)
+            //     Log.e(TAG, "updateTargetRotation: Updated FTV orientation directly as camera could not be restarted.")
+            // }
             return
         }
         
         // After startCamera() has (hopefully) reconfigured ImageAnalysis,
-        // update the FilteredTextureView's display orientation.
-        filteredTextureView?.let {
-            val degrees = degreesFromSurfaceRotation(rotation)
-            it.updateDisplayOrientation(degrees) // This will log inside FTV
-            Log.e(TAG, "updateTargetRotation: Called updateDisplayOrientation on FTV with $degrees degrees AFTER startCamera().")
-        }
+        // FTV no longer needs its display orientation updated from here.
+        // filteredTextureView?.let { // REMOVED
+        //     val degrees = degreesFromSurfaceRotation(rotation)
+        //     it.updateDisplayOrientation(degrees)
+        //     Log.e(TAG, "updateTargetRotation: Called updateDisplayOrientation on FTV with $degrees degrees AFTER startCamera().")
+        // }
     }
 
-    // Helper function to convert Surface.ROTATION_* to degrees for canvas rotation
-    private fun degreesFromSurfaceRotation(surfaceRotation: Int): Float {
-        return when (surfaceRotation) {
-            android.view.Surface.ROTATION_0 -> 0f
-            android.view.Surface.ROTATION_90 -> 270f // Canvas rotation for landscape left
-            android.view.Surface.ROTATION_180 -> 180f
-            android.view.Surface.ROTATION_270 -> 90f  // Canvas rotation for landscape right
-            else -> 0f
-        }
-    }
+    // Helper function to convert Surface.ROTATION_* to degrees for canvas rotation // REMOVED - No longer needed
+    // private fun degreesFromSurfaceRotation(surfaceRotation: Int): Float {
+    //     return when (surfaceRotation) {
+    //         android.view.Surface.ROTATION_0 -> 0f
+    //         android.view.Surface.ROTATION_90 -> 270f
+    //         android.view.Surface.ROTATION_180 -> 180f
+    //         android.view.Surface.ROTATION_270 -> 90f
+    //         else -> 0f
+    //     }
+    // }
 
     fun dispose() {
         try {

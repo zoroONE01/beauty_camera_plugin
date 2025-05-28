@@ -21,11 +21,11 @@ class FilteredTextureView @JvmOverloads constructor(
     private var surfaceReady = false
     private val bitmapLock = Any()
     private var nextBitmapToDraw: Bitmap? = null
-    private var currentDisplayOrientationDegrees: Float = 0f // Store current display orientation
+    // private var currentDisplayOrientationDegrees: Float = 0f // REMOVED - No longer needed
 
     init {
         surfaceTextureListener = this
-        isOpaque = false 
+        isOpaque = false
     }
 
     fun updateBitmap(newBitmap: Bitmap?) {
@@ -37,12 +37,12 @@ class FilteredTextureView @JvmOverloads constructor(
         }
     }
 
-    fun updateDisplayOrientation(degrees: Float) {
-        if (currentDisplayOrientationDegrees != degrees) {
-            currentDisplayOrientationDegrees = degrees
-            invalidate() // Request redraw with new orientation
-        }
-    }
+    // fun updateDisplayOrientation(degrees: Float) { // REMOVED - No longer needed
+    //     if (currentDisplayOrientationDegrees != degrees) {
+    //         currentDisplayOrientationDegrees = degrees
+    //         invalidate() // Request redraw with new orientation
+    //     }
+    // }
 
     private fun drawFrame() {
         val bitmapToRender: Bitmap?
@@ -70,11 +70,8 @@ class FilteredTextureView @JvmOverloads constructor(
                 scaleMatrix.setRectToRect(bufferRect, viewRect, Matrix.ScaleToFit.CENTER)
 
                 canvas.save()
-                // Apply the display orientation rotation (stored in currentDisplayOrientationDegrees)
-                // around the center of the canvas.
-                // --- TEST: Temporarily disable canvas rotation to see if bitmap from processor is already upright ---
-                // canvas.rotate(currentDisplayOrientationDegrees, canvasWidth / 2f, canvasHeight / 2f)
-                Log.d(TAG, "drawFrame: Canvas rotation (currentDisplayOrientationDegrees = $currentDisplayOrientationDegrees) is currently DISABLED for testing.")
+                // Canvas rotation is no longer needed here as BitmapProcessor provides an upright bitmap.
+                // The Log.d related to disabling canvas rotation can also be removed.
                 
                 // Draw the bitmap using the scaling matrix
                 canvas.drawBitmap(bitmapToRender, scaleMatrix, bitmapPaint)
