@@ -1,4 +1,4 @@
-# GitHub Copilot Instructions for Flutter Camera Plugin (Android - CameraX with Camera2 Interop Filters)
+<!-- # GitHub Copilot Instructions for Flutter Camera Plugin (Android - CameraX with Camera2 Interop Filters)
 
 ## 1. Project Overview and Goals
 
@@ -969,4 +969,4 @@ class FilterButton extends StatelessWidget {
     );
   }
 }
-```
+``` -->

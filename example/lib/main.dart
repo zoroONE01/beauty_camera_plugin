@@ -1,10 +1,11 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:beauty_camera_plugin/beauty_camera_plugin.dart';
-import 'package:permission_handler/permission_handler.dart'; // Import permission_handler
+import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   // Ensure Flutter binding is initialized
@@ -44,7 +45,7 @@ class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
 
   @override
-  _CameraScreenState createState() => _CameraScreenState();
+  State<CameraScreen> createState() => _CameraScreenState();
 }
 
 class _CameraScreenState extends State<CameraScreen>
@@ -56,13 +57,20 @@ class _CameraScreenState extends State<CameraScreen>
   bool _isCameraInitialized = false;
   bool _isCapturing = false;
   bool _isViewCreated = false;
-  String _currentFilter = 'none';
+  CameraFilter _currentFilter = CameraFilter.none;
+  double _filterIntensity = 1.0; // Filter intensity (0.0 to 1.0)
   double _zoomLevel = 0.0;
   String? _lastErrorMessage;
   String _currentFlashMode = 'off';
 
+  // Orientation state
+  StreamSubscription<OrientationData>? _orientationSubscription;
+
   // UI state
   bool _showFilterSelector = false;
+  bool _showIntensityControls = false;
+  int _selectedFilterCategory = 0; // 0 = Basic, 1 = Advanced
+  bool _isProcessingFilter = false;
 
   @override
   void initState() {
@@ -74,23 +82,17 @@ class _CameraScreenState extends State<CameraScreen>
   Future<void> _requestCameraPermissionAndInitialize() async {
     final status = await Permission.camera.request();
     if (status.isGranted) {
-      print("Camera permission granted.");
+
       // If view is already created, initialize camera. Otherwise, it will be initialized when view is created.
       if (_isViewCreated && !_isCameraInitialized) {
         _initializeCamera();
-      } else if (!_isViewCreated) {
-        print(
-          "View not created yet, camera will be initialized once view is ready.",
-        );
       }
     } else if (status.isDenied) {
-      print("Camera permission denied.");
       setState(() {
         _lastErrorMessage =
             "Camera permission denied. Please grant permission in settings.";
       });
     } else if (status.isPermanentlyDenied) {
-      print("Camera permission permanently denied.");
       setState(() {
         _lastErrorMessage =
             "Camera permission permanently denied. Please open settings to grant permission.";
@@ -116,10 +118,8 @@ class _CameraScreenState extends State<CameraScreen>
   }
 
   Future<void> _initializeCamera() async {
-    print("Initializing camera with view created = $_isViewCreated");
 
     if (!_isViewCreated) {
-      print("View not created yet, delaying camera initialization");
       setState(() {
         _lastErrorMessage = "Waiting for camera view to initialize...";
       });
@@ -132,17 +132,15 @@ class _CameraScreenState extends State<CameraScreen>
         _lastErrorMessage = null;
       });
 
-      print("Calling plugin.initializeCamera()");
       // Initialize the camera
       await _cameraPlugin.initializeCamera();
 
-      print("Camera initialized successfully");
       setState(() {
         _isCameraInitialized = true;
         _lastErrorMessage = null;
       });
+      _startListeningToOrientation(); // Bắt đầu lắng nghe sau khi camera khởi tạo thành công
     } catch (e) {
-      print('Error initializing camera: $e');
       setState(() {
         _isCameraInitialized = false;
         _lastErrorMessage = 'Failed to initialize camera: $e';
@@ -152,7 +150,6 @@ class _CameraScreenState extends State<CameraScreen>
       if (_isViewCreated) {
         Future.delayed(Duration(seconds: 2), () {
           if (!_isCameraInitialized && _isViewCreated) {
-            print("Attempting to reinitialize camera after error");
             _initializeCamera();
           }
         });
@@ -163,12 +160,10 @@ class _CameraScreenState extends State<CameraScreen>
   Future<void> _takePicture() async {
     // Additional check to prevent duplicate requests
     if (_isCapturing) {
-      print("Already capturing, ignoring duplicate request");
       return;
     }
 
     if (!_isCameraInitialized) {
-      print("Camera not initialized, cannot take picture");
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Camera not initialized yet. Please wait.')),
       );
@@ -181,15 +176,10 @@ class _CameraScreenState extends State<CameraScreen>
     // No need to set _isCapturing = true here as it's set by the button handler
 
     try {
-      print("Taking picture request initiated at ${DateTime.now()}");
       // Display visual feedback for capture
       HapticFeedback.mediumImpact();
 
       final String? imagePath = await _cameraPlugin.takePicture();
-
-      print(
-        "Picture taken successfully at ${DateTime.now()}, path: $imagePath",
-      );
 
       setState(() {
         _isCapturing = false;
@@ -198,14 +188,11 @@ class _CameraScreenState extends State<CameraScreen>
       if (imagePath != null) {
         _showPhotoPreviewDialog(imagePath);
       } else {
-        print("Image path is null, picture might not have been saved");
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text('Failed to save picture')));
       }
     } catch (e) {
-      print("Error taking picture at ${DateTime.now()}: $e");
-
       // Reset capturing state
       setState(() {
         _isCapturing = false;
@@ -260,7 +247,7 @@ class _CameraScreenState extends State<CameraScreen>
                       // ButtonBar với height cố định
                       SizedBox(
                         height: 48, // Height cố định cho ButtonBar
-                        child: ButtonBar(
+                        child: OverflowBar(
                           children: [
                             TextButton(
                               onPressed: () => Navigator.of(context).pop(),
@@ -285,19 +272,73 @@ class _CameraScreenState extends State<CameraScreen>
     );
   }
 
-  Future<void> _setFilter(String filter) async {
+  Future<void> _setFilter(CameraFilter filter) async {
     if (!_isCameraInitialized) return;
 
+    // Show processing indicator for advanced filters
+    final isAdvancedFilter = CameraFilter.advancedFilters.contains(filter);
+    if (isAdvancedFilter) {
+      setState(() {
+        _isProcessingFilter = true;
+      });
+    }
+
     try {
-      await _cameraPlugin.setFilter(filter);
+      await _cameraPlugin.setFilterEnum(filter);
       setState(() {
         _currentFilter = filter;
         _showFilterSelector = false; // Close filter selector after selection
+        _showIntensityControls =
+            filter.supportsIntensity; // Show intensity controls if supported
+        _isProcessingFilter = false;
       });
+
+      // Show feedback for successful filter application
+      if (isAdvancedFilter) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('${filter.displayName} filter applied successfully'),
+            duration: Duration(seconds: 2),
+            backgroundColor: Colors.green.withOpacity(0.8),
+          ),
+        );
+      }
     } catch (e) {
       setState(() {
         _lastErrorMessage = 'Failed to set filter: $e';
+        _isProcessingFilter = false;
       });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to apply ${filter.displayName} filter'),
+          duration: Duration(seconds: 3),
+          backgroundColor: Colors.red.withOpacity(0.8),
+        ),
+      );
+    }
+  }
+
+  Future<void> _setFilterIntensity(double intensity) async {
+    if (!_isCameraInitialized) return;
+
+    try {
+      await _cameraPlugin.setFilterIntensity(intensity);
+      setState(() {
+        _filterIntensity = intensity;
+      });
+    } catch (e) {
+      setState(() {
+        _lastErrorMessage = 'Failed to set filter intensity: $e';
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to set filter intensity'),
+          duration: Duration(seconds: 2),
+          backgroundColor: Colors.red.withOpacity(0.8),
+        ),
+      );
     }
   }
 
@@ -351,6 +392,18 @@ class _CameraScreenState extends State<CameraScreen>
     }
   }
 
+  /// Get filters for the selected category (0 = Basic, 1 = Advanced)
+  List<CameraFilter> _getFiltersForCategory(int category) {
+    switch (category) {
+      case 0:
+        return CameraFilter.basicFilters;
+      case 1:
+        return CameraFilter.advancedFilters;
+      default:
+        return CameraFilter.basicFilters;
+    }
+  }
+
   Future<void> _disposeCamera() async {
     if (_isCameraInitialized) {
       try {
@@ -359,8 +412,63 @@ class _CameraScreenState extends State<CameraScreen>
           _isCameraInitialized = false;
         });
       } catch (e) {
-        debugPrint('Error disposing camera: $e');
+        // Error handled by state management
       }
+    }
+  }
+
+  void _startListeningToOrientation() {
+    if (_orientationSubscription != null) {
+      _orientationSubscription!.cancel(); // Hủy subscription cũ nếu có
+    }
+    _orientationSubscription = _cameraPlugin.orientationStream.listen(
+      (OrientationData event) {
+        if (kDebugMode) {
+          print('[Flutter - Orientation] Received: ${event.toString()}');
+        }
+        // Gọi hàm cập nhật imageAnalysis của bạn dựa trên 'event'
+        // Ví dụ: sử dụng event.deviceOrientation hoặc event.uiOrientation
+        // để gọi một phương thức trên _cameraPlugin nếu cần thiết để native cập nhật ImageAnalysis.
+        // Dựa trên cấu trúc plugin, có vẻ bạn sẽ muốn gọi một phương thức như `updateCameraRotation`.
+        if (_isCameraInitialized) {
+          // Chỉ gọi nếu camera đã khởi tạo để tránh lỗi
+          try {
+            // Quyết định xem nên sử dụng deviceOrientation hay uiOrientation.
+            // Thông thường deviceOrientation phù hợp hơn cho việc điều chỉnh camera.
+            if (kDebugMode) {
+              print('[Flutter - Orientation] Preparing to call updateCameraRotation. Event: ${event.toString()}, DeviceOrientation: ${event.deviceOrientation}, Degrees: ${event.deviceOrientation.degrees}');
+            }
+            _cameraPlugin.updateCameraRotation(event.deviceOrientation);
+            if (kDebugMode) {
+              print('[Flutter - Orientation] Called updateCameraRotation with ${event.deviceOrientation} (Degrees: ${event.deviceOrientation.degrees})');
+            }
+          } catch (e) {
+            if (kDebugMode) {
+              print('[Flutter - Orientation] Error calling updateCameraRotation: $e');
+            }
+            setState(() {
+              _lastErrorMessage = 'Error updating camera for orientation: $e';
+            });
+          }
+        }
+      },
+      onError: (dynamic error) {
+        if (kDebugMode) {
+          print('[Flutter - Orientation] Error in orientation stream: ${error.toString()}');
+        }
+        setState(() {
+          _lastErrorMessage = 'Orientation stream error: ${error.toString()}';
+        });
+      },
+      onDone: () {
+        if (kDebugMode) {
+          print('[Flutter - Orientation] Orientation stream closed.');
+        }
+      },
+      cancelOnError: true,
+    );
+    if (kDebugMode) {
+      print('[Flutter - Orientation] Started listening to orientation events.');
     }
   }
 
@@ -386,7 +494,6 @@ class _CameraScreenState extends State<CameraScreen>
                 // This helps in case the callback is never invoked due to a silent failure
                 Future.delayed(Duration(seconds: 10), () {
                   if (mounted && _isCapturing) {
-                    print("Capture timeout - resetting capture state");
                     setState(() {
                       _isCapturing = false;
                     });
@@ -440,6 +547,7 @@ class _CameraScreenState extends State<CameraScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _orientationSubscription?.cancel();
     _disposeCamera();
     super.dispose();
   }
@@ -459,7 +567,6 @@ class _CameraScreenState extends State<CameraScreen>
                 creationParams: const <String, dynamic>{},
                 creationParamsCodec: const StandardMessageCodec(),
                 onPlatformViewCreated: (int id) {
-                  print("AndroidView (Platform view) created with id: $id");
                   setState(() {
                     _isViewCreated = true;
                   });
@@ -507,60 +614,238 @@ class _CameraScreenState extends State<CameraScreen>
                 ),
               ),
 
-            // Filter selector panel
+            // Filter selector panel - Enhanced with categories
             if (_showFilterSelector)
               Positioned(
                 bottom: 130,
                 left: 0,
                 right: 0,
                 child: Container(
-                  height: 100,
+                  height: 140,
                   decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.7),
+                    color: Colors.black.withOpacity(0.8),
                     borderRadius: BorderRadius.vertical(
-                      top: Radius.circular(12),
+                      top: Radius.circular(16),
+                    ),
+                    border: Border.all(
+                      color: Colors.white.withOpacity(0.1),
+                      width: 1,
                     ),
                   ),
                   child: Column(
                     children: [
-                      Padding(
-                        padding: const EdgeInsets.only(top: 4.0, bottom: 2.0),
-                        child: Text(
-                          'Select Filter',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.bold,
-                          ),
+                      // Drag handle
+                      Container(
+                        margin: const EdgeInsets.only(top: 8, bottom: 4),
+                        width: 40,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.3),
+                          borderRadius: BorderRadius.circular(2),
                         ),
                       ),
-                      Expanded(
-                        child: ListView(
-                          scrollDirection: Axis.horizontal,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 4,
-                          ),
+
+                      // Category tabs
+                      Container(
+                        height: 36,
+                        margin: const EdgeInsets.symmetric(horizontal: 16),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[900],
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Row(
                           children: [
-                            FilterButton(
-                              name: 'None',
-                              filterType: 'none',
-                              currentFilter: _currentFilter,
-                              onPressed: _setFilter,
+                            Expanded(
+                              child: GestureDetector(
+                                onTap:
+                                    () => setState(
+                                      () => _selectedFilterCategory = 0,
+                                    ),
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    color:
+                                        _selectedFilterCategory == 0
+                                            ? Colors.amber
+                                            : Colors.transparent,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Center(
+                                    child: Text(
+                                      'Basic',
+                                      style: TextStyle(
+                                        color:
+                                            _selectedFilterCategory == 0
+                                                ? Colors.black
+                                                : Colors.white,
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 14,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ),
-                            FilterButton(
-                              name: 'Sepia',
-                              filterType: 'sepia',
-                              currentFilter: _currentFilter,
-                              onPressed: _setFilter,
-                            ),
-                            FilterButton(
-                              name: 'Mono',
-                              filterType: 'mono',
-                              currentFilter: _currentFilter,
-                              onPressed: _setFilter,
+                            Expanded(
+                              child: GestureDetector(
+                                onTap:
+                                    () => setState(
+                                      () => _selectedFilterCategory = 1,
+                                    ),
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    color:
+                                        _selectedFilterCategory == 1
+                                            ? Colors.amber
+                                            : Colors.transparent,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Center(
+                                    child: Text(
+                                      'Advanced',
+                                      style: TextStyle(
+                                        color:
+                                            _selectedFilterCategory == 1
+                                                ? Colors.black
+                                                : Colors.white,
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 14,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ),
                           ],
                         ),
+                      ),
+
+                      const SizedBox(height: 8),
+
+                      // Filter list
+                      Expanded(
+                        child: ListView(
+                          scrollDirection: Axis.horizontal,
+                          padding: const EdgeInsets.symmetric(horizontal: 16),
+                          children:
+                              _getFiltersForCategory(_selectedFilterCategory)
+                                  .map(
+                                    (filter) => FilterButton(
+                                      name: filter.displayName,
+                                      filter: filter,
+                                      currentFilter: _currentFilter,
+                                      onPressed: _setFilter,
+                                    ),
+                                  )
+                                  .toList(),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+            // Filter processing indicator
+            if (_isProcessingFilter)
+              Positioned(
+                bottom: 130,
+                left: 0,
+                right: 0,
+                child: Container(
+                  height: 140,
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.7),
+                    borderRadius: BorderRadius.vertical(
+                      top: Radius.circular(16),
+                    ),
+                  ),
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        CircularProgressIndicator(
+                          color: Colors.amber,
+                          strokeWidth: 3,
+                        ),
+                        SizedBox(height: 12),
+                        Text(
+                          'Applying Advanced Filter...',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+
+            // Filter intensity controls
+            if (_showIntensityControls && _currentFilter.supportsIntensity)
+              Positioned(
+                bottom: 130,
+                left: 16,
+                right: 16,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.7),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: Colors.amber.withOpacity(0.3),
+                      width: 1,
+                    ),
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(
+                        children: [
+                          Text(
+                            'Intensity',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 14,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                          Spacer(),
+                          Text(
+                            '${(_filterIntensity * 100).round()}%',
+                            style: TextStyle(
+                              color: Colors.amber,
+                              fontSize: 14,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          SizedBox(width: 8),
+                          IconButton(
+                            icon: Icon(
+                              Icons.close,
+                              color: Colors.white,
+                              size: 20,
+                            ),
+                            onPressed:
+                                () => setState(
+                                  () => _showIntensityControls = false,
+                                ),
+                            padding: EdgeInsets.zero,
+                            constraints: BoxConstraints(),
+                          ),
+                        ],
+                      ),
+                      Slider(
+                        value: _filterIntensity,
+                        min: 0.0,
+                        max: 1.0,
+                        divisions: 20,
+                        onChanged: _setFilterIntensity,
+                        activeColor: Colors.amber,
+                        inactiveColor: Colors.white30,
                       ),
                     ],
                   ),
@@ -591,6 +876,24 @@ class _CameraScreenState extends State<CameraScreen>
                           ),
                       tooltip: 'Filters',
                     ),
+                    // Intensity controls button - only show for supported filters
+                    if (_currentFilter.supportsIntensity)
+                      IconButton(
+                        icon: Icon(
+                          Icons.tune,
+                          color:
+                              _showIntensityControls
+                                  ? Colors.amber
+                                  : Colors.white,
+                        ),
+                        onPressed:
+                            () => setState(
+                              () =>
+                                  _showIntensityControls =
+                                      !_showIntensityControls,
+                            ),
+                        tooltip: 'Filter Intensity',
+                      ),
                     _buildCaptureButton(),
                     IconButton(
                       icon: Icon(
@@ -663,73 +966,172 @@ class _CameraScreenState extends State<CameraScreen>
   }
 }
 
-// Helper widget for filter buttons
+// Enhanced FilterButton widget with better categorization support
 class FilterButton extends StatelessWidget {
   final String name;
-  final String filterType;
-  final String currentFilter;
-  final Function(String) onPressed;
+  final CameraFilter filter;
+  final CameraFilter currentFilter;
+  final Function(CameraFilter) onPressed;
 
   const FilterButton({
-    Key? key,
+    super.key,
     required this.name,
-    required this.filterType,
+    required this.filter,
     required this.currentFilter,
     required this.onPressed,
-  }) : super(key: key);
+  });
+
+  bool get _isAdvancedFilter => CameraFilter.advancedFilters.contains(filter);
 
   @override
   Widget build(BuildContext context) {
-    final isSelected = filterType == currentFilter;
+    final isSelected = filter == currentFilter;
 
-    // More compact layout with better touch targets
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8.0),
+      padding: const EdgeInsets.symmetric(horizontal: 6.0),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Button with visual feedback
+          // Button with enhanced visual feedback
           Material(
             color: Colors.transparent,
             child: InkWell(
-              onTap: () => onPressed(filterType),
-              customBorder: CircleBorder(),
+              onTap: () => onPressed(filter),
+              customBorder: const CircleBorder(),
+              splashColor: Colors.amber.withOpacity(0.3),
+              highlightColor: Colors.amber.withOpacity(0.1),
               child: Container(
-                width: 46, // Slightly smaller
-                height: 46, // Slightly smaller
+                width: 52,
+                height: 52,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   border: Border.all(
-                    color: isSelected ? Colors.amber : Colors.transparent,
-                    width: 2,
+                    color:
+                        isSelected
+                            ? Colors.amber
+                            : _isAdvancedFilter
+                            ? Colors.blue.withOpacity(0.6)
+                            : Colors.grey.withOpacity(0.4),
+                    width: isSelected ? 3 : 2,
                   ),
-                  color: Colors.grey[800],
+                  color:
+                      isSelected
+                          ? Colors.amber.withOpacity(0.2)
+                          : Colors.grey[850],
+                  gradient:
+                      _isAdvancedFilter && !isSelected
+                          ? LinearGradient(
+                            colors: [
+                              Colors.blue.withOpacity(0.1),
+                              Colors.purple.withOpacity(0.1),
+                            ],
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                          )
+                          : null,
                 ),
-                child: Center(
-                  child: Text(
-                    name.substring(0, 1),
-                    style: TextStyle(
-                      color: isSelected ? Colors.amber : Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 16, // Larger text for better visibility
-                    ),
-                  ),
+                child: Stack(
+                  children: [
+                    // Main filter icon/text
+                    Center(child: _getFilterIcon()),
+                    // Advanced filter indicator
+                    if (_isAdvancedFilter && !isSelected)
+                      Positioned(
+                        top: 4,
+                        right: 4,
+                        child: Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            color: Colors.blue,
+                            shape: BoxShape.circle,
+                            border: Border.all(color: Colors.white, width: 0.5),
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
               ),
             ),
           ),
-          const SizedBox(height: 4),
-          // Label
-          Text(
-            name,
-            style: TextStyle(
-              color: isSelected ? Colors.amber : Colors.white,
-              fontSize: 10,
-              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+          const SizedBox(height: 6),
+          // Enhanced label with better styling
+          Container(
+            constraints: const BoxConstraints(maxWidth: 60),
+            child: Text(
+              name,
+              textAlign: TextAlign.center,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: isSelected ? Colors.amber : Colors.white,
+                fontSize: 10,
+                fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                shadows: [
+                  Shadow(
+                    offset: const Offset(0, 1),
+                    blurRadius: 2,
+                    color: Colors.black.withOpacity(0.7),
+                  ),
+                ],
+              ),
             ),
           ),
         ],
       ),
+    );
+  }
+
+  Widget _getFilterIcon() {
+    // Custom icons for specific filters
+    IconData? iconData;
+    switch (filter) {
+      case CameraFilter.none:
+        iconData = Icons.no_photography_outlined;
+        break;
+      case CameraFilter.sepia:
+        iconData = Icons.palette_outlined;
+        break;
+      case CameraFilter.grayscale:
+        iconData = Icons.monochrome_photos_outlined;
+        break;
+      case CameraFilter.negative:
+        iconData = Icons.invert_colors_outlined;
+        break;
+      case CameraFilter.vintage:
+        iconData = Icons.camera_outlined;
+        break;
+      case CameraFilter.cool:
+        iconData = Icons.ac_unit_outlined;
+        break;
+      case CameraFilter.warm:
+        iconData = Icons.wb_sunny_outlined;
+        break;
+      case CameraFilter.blur:
+        iconData = Icons.blur_on_outlined;
+        break;
+      case CameraFilter.sharpen:
+        iconData = Icons.auto_fix_high_outlined;
+        break;
+      case CameraFilter.edge:
+        iconData = Icons.crop_outlined;
+        break;
+      default:
+        iconData = Icons.filter_vintage_outlined;
+        break;
+    }
+
+    final isSelected = filter == currentFilter;
+
+    return Icon(
+      iconData,
+      size: 20,
+      color:
+          isSelected
+              ? Colors.amber
+              : _isAdvancedFilter
+              ? Colors.blue.withOpacity(0.9)
+              : Colors.white.withOpacity(0.9),
     );
   }
 }

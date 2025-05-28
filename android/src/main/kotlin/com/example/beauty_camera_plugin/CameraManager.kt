@@ -1,798 +1,800 @@
 package com.example.beauty_camera_plugin
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
+import android.graphics.Matrix // Added for rotation
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.app.Activity
 import android.content.Context
-import android.graphics.*
-import android.graphics.BitmapFactory
-import android.graphics.SurfaceTexture // Thêm import này
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
-// import android.hardware.camera2.CaptureRequest // Không còn dùng trực tiếp cho preview filter
+import android.hardware.camera2.CaptureRequest
 import android.net.Uri
 import android.util.Log
-import android.util.Size // Thêm import này
-import android.view.Surface
-import android.view.OrientationEventListener
-import androidx.exifinterface.media.ExifInterface
-import androidx.camera.camera2.interop.Camera2CameraInfo
-// import androidx.camera.camera2.interop.Camera2Interop // Không còn dùng cho preview filter
+import android.util.Size
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.*
-import androidx.camera.core.Camera
-import androidx.camera.core.Preview
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
 import androidx.camera.lifecycle.ProcessCameraProvider
-// import androidx.camera.view.PreviewView // Không dùng PreviewView nữa
+// import androidx.camera.view.PreviewView // No longer directly managing PreviewView here
 import androidx.core.content.ContextCompat
+import androidx.exifinterface.media.ExifInterface
+import com.example.beauty_camera_plugin.FilteredTextureView
 import androidx.lifecycle.LifecycleOwner
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.LinkedList
 
-class CameraManager(
-    private val context: Context,
-    private var activity: Activity,
-    private val lifecycleOwner: LifecycleOwner,
-    initialLensFacing: Int? = null,
-    initialZoomRatio: Float? = null,
-    initialFlashMode: String? = null,
-    initialFilterType: String? = null
-) {
+class CameraManager(private val activity: Activity) {
     companion object {
         private const val TAG = "CameraManager"
+        private const val FILENAME_FORMAT = "yyyy-MM-dd-HH-mm-ss-SSS"
     }
 
     private var cameraProvider: ProcessCameraProvider? = null
+    private var camera: Camera? = null
     private var preview: Preview? = null
     private var imageCapture: ImageCapture? = null
-    private var camera: Camera? = null
-    private var cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    private var cameraGLSurfaceView: CameraGLSurfaceView? = null
-
-    private var currentFilterType: String
-    private var cameraSelector: CameraSelector
-    private var currentFlashMode: Int
-    private var currentZoomRatio: Float = 0.5f // Default zoom, can be overridden
-
-    private val scope = CoroutineScope(Job() + Dispatchers.Main)
-    private var _isDisposed = false
-
-    init {
-        this.cameraSelector = initialLensFacing?.let {
-            CameraSelector.Builder().requireLensFacing(it).build()
-        } ?: CameraSelector.DEFAULT_BACK_CAMERA
-        Log.i(TAG, "Initial lens facing: ${if (this.cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) "FRONT" else "BACK"} (from saved: $initialLensFacing)")
-
-        this.currentZoomRatio = initialZoomRatio ?: 0.0f // CameraX zoom is 0.0 (min) to 1.0 (max linear)
-        Log.i(TAG, "Initial zoom ratio: ${this.currentZoomRatio} (from saved: $initialZoomRatio)")
-
-        this.currentFlashMode = when (initialFlashMode?.lowercase()) {
-            "on" -> ImageCapture.FLASH_MODE_ON
-            "auto" -> ImageCapture.FLASH_MODE_AUTO
-            else -> ImageCapture.FLASH_MODE_OFF
-        }
-        Log.i(TAG, "Initial flash mode: ${this.currentFlashMode} (from saved: $initialFlashMode)")
-
-        this.currentFilterType = initialFilterType ?: "none"
-        Log.i(TAG, "Initial filter type: ${this.currentFilterType} (from saved: $initialFilterType)")
-
-        // Apply initial filter to renderer if view is already available (might be too early)
-        // This will be reapplied in bindCameraUseCases or when setFilter is called.
-        // cameraGLSurfaceView?.setFilter(this.currentFilterType)
-    }
+    private var imageAnalysis: ImageAnalysis? = null
+    private var filteredTextureView: FilteredTextureView? = null // Changed from previewView
     
-    // Flag to track if a capture is in progress
-    private var isCaptureInProgress = false
-    // Queue to track pending capture requests
-    private val pendingCaptureRequests = LinkedList<CaptureRequest>()
+    // Camera state
+    private var currentFilterType = "none"
+    private var currentFilterIntensity = 1.0f
+    private var isBackCamera = true
+    private var flashMode = ImageCapture.FLASH_MODE_OFF
+    private var currentTargetRotation: Int? = null // Store current target rotation
     
-    // Data class to hold a capture request
-    private data class CaptureRequest(
-        val photoFile: File,
-        val callback: (String?, String?) -> Unit
-    )
+    // Threading
+    private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    
+    // Orientation handler
+    val orientationStreamHandler = OrientationStreamHandler(activity)
 
-    private var orientationEventListener: OrientationEventListener? = null
-    private var lastKnownRotation: Int = Surface.ROTATION_0
-    private var currentDeviceOrientation: Int = 0 // Physical device orientation in degrees (0, 90, 180, 270)
-    private var targetResolution: Size? = null // Để lưu kích thước mục tiêu cho preview
-
-    fun initializeCamera(glView: CameraGLSurfaceView, callback: (Boolean, String?) -> Unit) {
-        Log.i(TAG, ">>> initializeCamera START. GLSurfaceView (param): $glView, IsDisposed: $_isDisposed, Current cameraGLSurfaceView: ${this.cameraGLSurfaceView}")
-        if (_isDisposed) {
-            Log.w(TAG, "initializeCamera called on a disposed CameraManager. Re-initializing. Setting _isDisposed to false.")
-            // Potentially reset some state if needed, though _isDisposed = false is key
-        }
-        _isDisposed = false // Ensure manager is not marked as disposed
-        this.cameraGLSurfaceView = glView
-        Log.i(TAG, "initializeCamera: Assigned GLSurfaceView. this.cameraGLSurfaceView: ${this.cameraGLSurfaceView}, renderer: ${this.cameraGLSurfaceView?.renderer}, surfaceTexture: ${this.cameraGLSurfaceView?.getCameraSurfaceTexture()}")
-
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-        cameraProviderFuture.addListener({
-            Log.i(TAG, "initializeCamera: CameraProviderFuture listener invoked. IsDisposed: $_isDisposed")
-            if (_isDisposed) {
-                Log.w(TAG, "initializeCamera: CameraProviderFuture listener: CameraManager is disposed. Aborting.")
-                callback(false, "CameraManager disposed during initialization.")
-                return@addListener
-            }
-            try {
-                cameraProvider = cameraProviderFuture.get()
-                Log.i(TAG, "initializeCamera: CameraProvider obtained: $cameraProvider. Calling bindCameraUseCases().")
-                // Không cần chờ surfaceProvider của PreviewView nữa
-                // GLSurfaceView sẽ tự quản lý surface của nó.
-                // Chúng ta sẽ lấy SurfaceTexture từ renderer của GLSurfaceView.
-                bindCameraUseCases() // Gọi bindCameraUseCases trực tiếp
-                Log.i(TAG, "initializeCamera: bindCameraUseCases() call completed.")
-                callback(true, null)
-            } catch (e: Exception) {
-                Log.e(TAG, "initializeCamera: Camera provider initialization failed", e)
-                callback(false, "Camera provider initialization failed: ${e.message}")
-            }
-        }, ContextCompat.getMainExecutor(context))
-        Log.i(TAG, "initializeCamera: Added listener to cameraProviderFuture.")
-
-        // Setup orientation listener to track physical device orientation
-        // Even though screen is locked to portrait, we need to know physical orientation for photo capture
-        if (orientationEventListener == null) {
-            orientationEventListener = object : OrientationEventListener(context) {
-                override fun onOrientationChanged(orientation: Int) {
-                    if (orientation == ORIENTATION_UNKNOWN) return
+    fun initialize(callback: (Boolean, String?) -> Unit) {
+        try {
+            val cameraProviderFuture = ProcessCameraProvider.getInstance(activity)
+            cameraProviderFuture.addListener({
+                try {
+                    cameraProvider = cameraProviderFuture.get()
                     
-                    // Convert raw orientation to discrete rotation values
-                    val newDeviceOrientation = when {
-                        orientation >= 315 || orientation < 45 -> 0      // Portrait
-                        orientation >= 45 && orientation < 135 -> 90     // Landscape left (rotated 90° CCW)
-                        orientation >= 135 && orientation < 225 -> 180   // Portrait upside down
-                        orientation >= 225 && orientation < 315 -> 270   // Landscape right (rotated 90° CW)
-                        else -> currentDeviceOrientation // Keep current if can't determine
+                    // If filteredTextureView is already set (via setFilteredTextureView), start the camera
+                    if (filteredTextureView != null) {
+                        startCamera()
                     }
-                    
-                    if (newDeviceOrientation != currentDeviceOrientation) {
-                        Log.d(TAG, "DEBUG_ORIENTATION: Physical device orientation changed")
-                        Log.d(TAG, "  Raw orientation: $orientation degrees")
-                        Log.d(TAG, "  Old device orientation: $currentDeviceOrientation degrees")
-                        Log.d(TAG, "  New device orientation: $newDeviceOrientation degrees")
-                        Log.d(TAG, "  Screen remains LOCKED to portrait - preview unchanged")
-                        
-                        currentDeviceOrientation = newDeviceOrientation
-                        
-                        // Convert device orientation to Surface rotation for ImageCapture
-                        val surfaceRotation = when (newDeviceOrientation) {
-                            0 -> Surface.ROTATION_0
-                            90 -> Surface.ROTATION_90
-                            180 -> Surface.ROTATION_180
-                            270 -> Surface.ROTATION_270
-                            else -> Surface.ROTATION_0
-                        }
-                        
-                        updateUseCaseRotations(surfaceRotation)
-                        
-                        Log.d(TAG, "DEBUG_ORIENTATION: Updated ImageCapture rotation for device orientation $newDeviceOrientation°")
-                        Log.d(TAG, "  Preview stays portrait (always ROTATION_0)")
-                        Log.d(TAG, "  ImageCapture rotation: $surfaceRotation")
-                    }
+                    callback(true, null)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Camera provider initialization failed", e)
+                    callback(false, "Failed to initialize camera: ${e.message}")
                 }
-            }
-            orientationEventListener?.enable()
-            Log.d(TAG, "DEBUG_ORIENTATION: OrientationEventListener enabled for physical device tracking")
+            }, ContextCompat.getMainExecutor(activity))
+        } catch (e: Exception) {
+            Log.e(TAG, "Camera initialization failed", e)
+            callback(false, "Failed to initialize camera: ${e.message}")
         }
     }
 
-    private fun createPreviewUseCase(surfaceTexture: SurfaceTexture): Preview {
-        // Lấy kích thước mục tiêu (ví dụ: 1280x720)
-        // Bạn có thể muốn làm cho nó có thể cấu hình hoặc chọn dựa trên thiết bị
-        targetResolution = Size(1280, 720) // Ví dụ
-        surfaceTexture.setDefaultBufferSize(targetResolution!!.width, targetResolution!!.height)
-        
-        // LOCK PREVIEW TO PORTRAIT: Always use ROTATION_0 for preview
-        // This keeps camera preview in portrait orientation regardless of device rotation
-        val previewTargetRotation = Surface.ROTATION_0 // Always portrait for preview
-        Log.d(TAG, "DEBUG_ORIENTATION: createPreviewUseCase")
-        Log.d(TAG, "  Preview targetRotation: $previewTargetRotation (LOCKED TO PORTRAIT)")
-        Log.d(TAG, "  Device rotation: ${cameraGLSurfaceView?.display?.rotation}")
-        Log.d(TAG, "  Preview targetResolution: ${targetResolution!!.width}x${targetResolution!!.height}")
-        
+    // New method to accept FilteredTextureView
+    fun setFilteredTextureView(view: FilteredTextureView) {
+        this.filteredTextureView = view
+        // Update its orientation immediately if we already have a target rotation
+        currentTargetRotation?.let { surfaceRotation ->
+            val degrees = degreesFromSurfaceRotation(surfaceRotation)
+            view.updateDisplayOrientation(degrees)
+        }
+        // Only start camera if cameraProvider is already initialized
+        if (cameraProvider != null) {
+            startCamera()
+        }
+    }
+
+    private fun startCamera() {
+        val lifecycleOwner = activity as? LifecycleOwner ?: run {
+            Log.e(TAG, "Activity ($activity) is not a LifecycleOwner. Cannot start camera.")
+            return
+        }
+
+        val provider = cameraProvider ?: run {
+            Log.e(TAG, "CameraProvider is null. Cannot start camera.")
+            return
+        }
+
+        // We still need a Preview use case for CameraX to function correctly with ImageAnalysis,
+        // but we don't necessarily need to display its output if FilteredTextureView handles it.
+        // However, startCamera might be called before filteredTextureView is set if initialization order changes.
+        // For now, let's assume filteredTextureView will be set before or around the time startCamera is needed.
+        // If filteredTextureView is null here, it might mean an issue with initialization order.
+        if (this.filteredTextureView == null) {
+            Log.w(TAG, "startCamera called but filteredTextureView is null. Camera might not display correctly yet.")
+            // Depending on the flow, we might want to return or proceed cautiously.
+            // For now, proceed, as Preview use case itself doesn't strictly need a visible view.
+        }
+
+        try {
+            // Unbind all use cases
+            provider.unbindAll()
+
+            // Build camera selector
+            val cameraSelector = if (isBackCamera) {
+                CameraSelector.DEFAULT_BACK_CAMERA
+            } else {
+                CameraSelector.DEFAULT_FRONT_CAMERA
+            }
+
+            // Build preview use case.
+            // Even if not displayed directly, CameraX might require it.
+            // We won't set its surface provider to the old PreviewView.
+            // If ImageAnalysis is the sole source for display, Preview's output might not be used.
+            preview = createPreviewUseCase()
+            // preview?.setSurfaceProvider(currentPreviewView.surfaceProvider) // No longer setting to a PreviewView
+
+            // Build image capture use case
+            imageCapture = createImageCaptureUseCase()
+
+            // Build image analysis use case
+            // Ensure currentTargetRotation is non-null, fallback to display rotation if necessary
+            val rotationForAnalysis = currentTargetRotation ?: activity.display?.rotation ?: android.view.Surface.ROTATION_0
+            imageAnalysis = createImageAnalysisUseCase(rotationForAnalysis)
+
+            // Bind use cases to lifecycle
+            val useCasesToBind = mutableListOf(preview, imageCapture, imageAnalysis)
+                .filterNotNull() // Filter out null use cases, just in case
+
+            if (useCasesToBind.size < 2) { // Need at least preview and one other (capture or analysis)
+                return
+            }
+            
+            camera = provider.bindToLifecycle(
+                lifecycleOwner,
+                cameraSelector,
+                *useCasesToBind.toTypedArray() // Spread operator for varargs
+            )
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start camera or bind use cases", e)
+            // Reset state on failure
+            camera = null
+            preview = null
+            imageCapture = null
+            imageAnalysis = null
+        }
+    }
+
+    private fun createPreviewUseCase(): Preview {
+        // Use a default rotation or the activity's display rotation if filteredTextureView is not yet available
+        val displayRotation = activity.display?.rotation ?: android.view.Surface.ROTATION_0
+        val rotationToApply = currentTargetRotation ?: displayRotation
         return Preview.Builder()
-            .setTargetResolution(targetResolution!!) // Đặt kích thước mục tiêu
-            .setTargetRotation(previewTargetRotation) // ALWAYS PORTRAIT cho preview
-            .build()
-            .also {
-                // Không dùng setSurfaceProvider với PreviewView nữa
-                // Thay vào đó, chúng ta sẽ cung cấp SurfaceTexture trực tiếp
-                it.setSurfaceProvider { request ->
-                    val surface = Surface(surfaceTexture)
-                    request.provideSurface(surface, ContextCompat.getMainExecutor(context)) {
-                        Log.d(TAG, "Surface released for Preview: ${it.surface}")
-                        surface.release() // Quan trọng: giải phóng surface khi không dùng nữa
-                    }
+            .apply {
+                setTargetRotation(rotationToApply)
+                if (currentFilterType != "none") {
+                    // Apply camera2 specific options for live preview filter
+                    val camera2Interop = Camera2Interop.Extender(this)
+                    applyEffectToPreview(camera2Interop, currentFilterType)
                 }
-                Log.d(TAG, "Preview use case created with SurfaceTexture target (PORTRAIT LOCKED).")
             }
+            .build()
     }
 
     private fun createImageCaptureUseCase(): ImageCapture {
-        val targetRotation = cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0
-        Log.d(TAG, "DEBUG_ORIENTATION: createImageCaptureUseCase")
-        Log.d(TAG, "  ImageCapture targetRotation: $targetRotation")
-        Log.d(TAG, "  FlashMode: $currentFlashMode")
-        
+        val displayRotation = activity.display?.rotation ?: android.view.Surface.ROTATION_0
+        val rotationToApply = currentTargetRotation ?: displayRotation
         return ImageCapture.Builder()
-            .setTargetRotation(targetRotation)
-            .setFlashMode(currentFlashMode) // Apply current flash mode
+            .apply {
+                setTargetRotation(rotationToApply)
+                setFlashMode(flashMode)
+                setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            }
             .build()
     }
 
-    private fun bindCameraUseCases() {
-        Log.i(TAG, ">>> bindCameraUseCases START. CameraProvider: $cameraProvider, GLView: $cameraGLSurfaceView, IsDisposed: $_isDisposed")
-        if (_isDisposed) {
-            Log.w(TAG, "bindCameraUseCases: CameraManager is disposed. Aborting.")
-            return
-        }
-        if (cameraProvider == null) {
-            Log.e(TAG, "bindCameraUseCases: CameraProvider is null. Cannot bind.")
-            // Consider invoking callback with error if this happens after initialization attempt
-            return
-        }
-        val glView = cameraGLSurfaceView // Capture current value
-        if (glView == null) {
-            Log.e(TAG, "bindCameraUseCases: CameraGLSurfaceView (this.cameraGLSurfaceView) is null. Cannot bind. This should not happen if initializeCamera was called.")
-            // Consider invoking callback with error
-            return
-        }
-        Log.i(TAG, "bindCameraUseCases: GLView instance: $glView, GLView.renderer: ${glView.renderer}")
-
-        val surfaceTexture = glView.getCameraSurfaceTexture() // This calls Log in CameraGLSurfaceView
-        Log.i(TAG, "bindCameraUseCases: SurfaceTexture from glView.getCameraSurfaceTexture(): $surfaceTexture")
-
-        if (surfaceTexture == null) {
-            Log.e(TAG, "bindCameraUseCases: SurfaceTexture from GLRenderer is NULL. GLSurfaceView might not be ready. Posting retry.")
-            // GLSurfaceView có thể chưa sẵn sàng. Thử lại sau một chút.
-            glView.post {
-                Log.i(TAG, "bindCameraUseCases: Retry block posted to glView. IsDisposed: $_isDisposed")
-                if (_isDisposed) {
-                    Log.w(TAG, "bindCameraUseCases: Retry: CameraManager is disposed. Aborting retry.")
-                    return@post
+        // Modified to accept rotation as a parameter
+        private fun createImageAnalysisUseCase(targetRotationForUseCase: Int): ImageAnalysis {
+            Log.d(TAG, "createImageAnalysisUseCase: Setting targetRotation to: $targetRotationForUseCase (Surface.ROTATION_*)")
+            return ImageAnalysis.Builder()
+                .setTargetRotation(targetRotationForUseCase) // Quan trọng!
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+                .also {
+                    // Pass the targetRotationForUseCase to the BitmapProcessor
+                    it.setAnalyzer(cameraExecutor, BitmapProcessor(targetRotationForUseCase))
                 }
-                val currentSurfaceTextureInRetry = glView.getCameraSurfaceTexture()
-                Log.i(TAG, "bindCameraUseCases: Retrying bindCameraUseCases via glView.post. Current SurfaceTexture from view in retry: $currentSurfaceTextureInRetry")
-                if (currentSurfaceTextureInRetry != null) {
-                    bindCameraUseCases() // Recursive call, ensure it's safe
+        }
+
+    // Utility to convert YUV_420_888 ImageProxy to Bitmap
+    // This is a simplified version. For production, consider a more robust library or method.
+    private fun ImageProxy.toBitmap(): Bitmap? {
+        val format = this.format
+        if (format != ImageFormat.YUV_420_888) {
+            Log.e(TAG, "Unsupported image format: $format. Only YUV_420_888 is supported for now.")
+            return null
+        }
+
+        val yBuffer = planes[0].buffer // Y
+        val uBuffer = planes[1].buffer // U
+        val vBuffer = planes[2].buffer // V
+
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
+
+        val nv21 = ByteArray(ySize + uSize + vSize)
+
+        yBuffer.get(nv21, 0, ySize)
+        vBuffer.get(nv21, ySize, vSize) // Swapped U and V for NV21
+        uBuffer.get(nv21, ySize + vSize, uSize)
+
+
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, this.width, this.height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, yuvImage.width, yuvImage.height), 100, out)
+        val imageBytes = out.toByteArray()
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+    }
+
+
+    // Modified to accept the configured Surface rotation for the ImageAnalysis use case
+    private inner class BitmapProcessor(private val configuredSurfaceRotationForAnalyzer: Int) : ImageAnalysis.Analyzer {
+        private var frameCounter = 0
+        private val maxFramesToSave = 3 // Save 3 frames for debugging
+
+        @androidx.camera.core.ExperimentalGetImage
+        override fun analyze(image: ImageProxy) {
+            val imageProxyRotationDegrees = image.imageInfo.rotationDegrees // This is from ImageProxy
+            Log.d(TAG, "BitmapProcessor: analyze() called. ImageProxy rotationDegrees: $imageProxyRotationDegrees, Image W: ${image.width}, H: ${image.height}, Format: ${image.format}")
+
+            val unrotatedBitmap = image.toBitmap()
+
+            if (unrotatedBitmap != null) {
+                Log.d(TAG, "BitmapProcessor: unrotatedBitmap created. W: ${unrotatedBitmap.width}, H: ${unrotatedBitmap.height}")
+                // saveBitmapForDebug(unrotatedBitmap, "debug_unrotated_${System.currentTimeMillis()}_${imageProxyRotationDegrees}deg.jpg")
+
+                val rotatedBitmap: Bitmap
+                if (imageProxyRotationDegrees != 0) {
+                    val matrix = Matrix().apply { postRotate(imageProxyRotationDegrees.toFloat()) }
+                    rotatedBitmap = Bitmap.createBitmap(
+                        unrotatedBitmap, 0, 0, unrotatedBitmap.width, unrotatedBitmap.height, matrix, true
+                    )
+                    Log.d(TAG, "BitmapProcessor: rotatedBitmap created with ${imageProxyRotationDegrees}deg. W: ${rotatedBitmap.width}, H: ${rotatedBitmap.height}")
+                    if (unrotatedBitmap !== rotatedBitmap && !unrotatedBitmap.isRecycled) {
+                        // unrotatedBitmap.recycle(); // Keep for now if saving for debug
+                    }
                 } else {
-                    Log.e(TAG, "bindCameraUseCases: Retry: SurfaceTexture is STILL NULL in retry. Not calling bindCameraUseCases again immediately.")
-                    // Consider a more robust retry mechanism if this happens frequently, e.g., with a delay or max attempts.
+                    rotatedBitmap = unrotatedBitmap // No rotation needed
+                    Log.d(TAG, "BitmapProcessor: rotatedBitmap is unrotatedBitmap (no rotation needed). W: ${rotatedBitmap.width}, H: ${rotatedBitmap.height}")
                 }
+                // saveBitmapForDebug(rotatedBitmap, "debug_rotated_${System.currentTimeMillis()}_${imageProxyRotationDegrees}deg.jpg")
+
+
+                var bitmapToProcess = rotatedBitmap
+                var processedBitmap = bitmapToProcess
+                var filterAppliedThisFrame = false
+
+                if (currentFilterType != "none") {
+                    // Only apply custom filters here. Camera2 native effects are on Preview use case.
+                    if (currentFilterType !in listOf("grayscale", "mono", "negative", "solarize", "posterize")) {
+                        filterAppliedThisFrame = true
+                        processedBitmap = when (currentFilterType.lowercase()) {
+                            "sepia" -> FilterProcessor.applySepia(bitmapToProcess, currentFilterIntensity)
+                            "vintage" -> FilterProcessor.applyVintage(bitmapToProcess, currentFilterIntensity)
+                            "cool" -> FilterProcessor.applyCool(bitmapToProcess, currentFilterIntensity)
+                            "warm" -> FilterProcessor.applyWarm(bitmapToProcess, currentFilterIntensity)
+                            "blur" -> FilterProcessor.applyBlur(bitmapToProcess, currentFilterIntensity)
+                            "sharpen" -> FilterProcessor.applySharpen(bitmapToProcess, currentFilterIntensity)
+                            "edge" -> FilterProcessor.applyEdge(bitmapToProcess, currentFilterIntensity)
+                            "vignette" -> FilterProcessor.applyVignette(bitmapToProcess, currentFilterIntensity)
+                            "contrast" -> FilterProcessor.applyContrast(bitmapToProcess, currentFilterIntensity)
+                            "brightness" -> FilterProcessor.applyBrightness(bitmapToProcess, currentFilterIntensity)
+                            else -> { // Should not happen if check above is correct
+                                filterAppliedThisFrame = false
+                                bitmapToProcess
+                            }
+                        }
+                    } else {
+                        // For Camera2 native effect types, we don't re-apply them in ImageAnalysis for debug saving.
+                        // We just save the rotated frame.
+                        // If you want to see these effects in saved debug frames, you'd need to
+                        // replicate their logic from FilterProcessor or use a different approach.
+                        // For now, we treat them as "no custom filter applied in ImageAnalysis".
+                        processedBitmap = bitmapToProcess // Use the rotated bitmap directly
+                        // To still save these frames for rotation check, we can set filterAppliedThisFrame to true
+                        // if we want to save them, or handle saving outside the `if (filterAppliedThisFrame)` block.
+                        // Let's assume for now we only save if a *custom* filter from FilterProcessor was run.
+                        // If you want to save all frames passing through, adjust the logic.
+                    }
+                }
+
+                if (filterAppliedThisFrame) {
+                    if (frameCounter < maxFramesToSave) {
+                        saveBitmapForDebug(processedBitmap, "filtered_frame_${currentFilterType}_${frameCounter}_${System.currentTimeMillis()}.jpg")
+                        frameCounter++
+                    }
+                } else if (currentFilterType == "none" || currentFilterType in listOf("grayscale", "mono", "negative", "solarize", "posterize")) {
+                    // Optionally, save a few "unfiltered" (but rotated) frames for comparison or if a native filter is active
+                    // This part is for debugging the rotation itself even if no custom filter is applied
+                    if (frameCounter < maxFramesToSave && currentFilterType != "none") { // Example: save if a native filter is selected
+                    } else if (frameCounter < 1 && currentFilterType == "none") { // Save one "none" frame
+                    }
+                }
+
+
+                // --- Bitmap Recycling Logic ---
+                // processedBitmap is the one we saved (if any).
+                // bitmapToProcess was the input to the filter.
+                // rotatedBitmap was the result of rotation.
+
+                if (processedBitmap !== bitmapToProcess && !bitmapToProcess.isRecycled) {
+                    // If filter created a new bitmap, and bitmapToProcess was the input to filter, recycle bitmapToProcess.
+                    // This happens if bitmapToProcess was 'rotatedBitmap' and filter made a new one.
+                    bitmapToProcess.recycle()
+                }
+
+                // If processedBitmap is the one that was newly created by a filter (i.e., different from its input bitmapToProcess)
+                // and we are done with it (e.g., after saving), it should be recycled.
+                // If no filter was applied, processedBitmap is the same as bitmapToProcess (which is rotatedBitmap).
+                if (filterAppliedThisFrame && processedBitmap !== bitmapToProcess && !processedBitmap.isRecycled) {
+                    // processedBitmap.recycle(); // Temporarily disable for checking saved files
+                } else if (!filterAppliedThisFrame && processedBitmap === rotatedBitmap && !processedBitmap.isRecycled) {
+                    // If no custom filter applied, processedBitmap is just rotatedBitmap.
+                    // If we didn't save it or do anything else with it, recycle it.
+                    // processedBitmap.recycle(); // Temporarily disable
+                }
+
+                // Update the FilteredTextureView with the processed (or just rotated) bitmap
+                filteredTextureView?.updateBitmap(processedBitmap)
+                // Note: The ownership and recycling of 'processedBitmap' needs careful handling.
+                // If updateBitmap takes ownership (e.g. makes a copy or recycles after drawing),
+                // then we don't recycle here. If not, and it's a new bitmap, it should be recycled
+                // after updateBitmap is done with it. For now, FilteredTextureView's logic is
+                // designed to handle the bitmap passed to it. We've also disabled aggressive recycling
+                // in FilteredTextureView for now.
+
+            } else {
+                Log.e(TAG, "ImageAnalysis: Failed to convert ImageProxy to Bitmap.")
             }
-            Log.i(TAG, "bindCameraUseCases: Posted retry to glView. Returning for now.")
+            image.close()
+        }
+    }
+
+    private fun saveBitmapForDebug(bitmap: Bitmap, filename: String) {
+        val FOLDER_NAME = "filtered_frames_debug"
+        val mediaDir = activity.getExternalFilesDir(null)?.let {
+            File(it, FOLDER_NAME).apply { mkdirs() }
+        }
+
+        if (mediaDir == null || !mediaDir.exists()) {
+            Log.e(TAG, "Failed to create directory for debug frames.")
             return
         }
-        Log.i(TAG, "bindCameraUseCases: SurfaceTexture obtained successfully: $surfaceTexture. Proceeding with binding.")
 
-        // Apply the current (possibly restored) filter type to the GLSurfaceView's renderer
-        // This ensures the renderer is up-to-date before the camera preview starts.
-        cameraGLSurfaceView?.setFilter(currentFilterType)
-        Log.i(TAG, "bindCameraUseCases: Applied filter '$currentFilterType' to GLSurfaceView renderer.")
+        val file = File(mediaDir, filename)
+        try {
+            FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save debug frame", e)
+        }
+    }
 
-        Log.i(TAG, "bindCameraUseCases: Binding camera use cases. Current filter: $currentFilterType, CameraSelector: $cameraSelector, FlashMode: $currentFlashMode, Zoom: $currentZoomRatio")
+    private fun applyEffectToPreview(
+        interop: Camera2Interop.Extender<*>,
+        filterType: String
+    ) {
+        when (filterType.lowercase()) {
+            "sepia" -> {
+                // Sepia is applied in post-processing via FilterProcessor.
+                // For preview, set to OFF or a similar basic effect if desired.
+                Log.d(TAG, "Applying CONTROL_EFFECT_MODE_OFF for sepia preview (post-processing only)")
+                interop.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_EFFECT_MODE,
+                    CameraMetadata.CONTROL_EFFECT_MODE_OFF
+                )
+            }
+            "grayscale", "mono" -> {
+                Log.d(TAG, "Applying CONTROL_EFFECT_MODE_MONO for $filterType preview")
+                interop.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_EFFECT_MODE,
+                    CameraMetadata.CONTROL_EFFECT_MODE_MONO
+                )
+            }
+            "negative" -> {
+                Log.d(TAG, "Applying CONTROL_EFFECT_MODE_NEGATIVE for $filterType preview")
+                interop.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_EFFECT_MODE,
+                    CameraMetadata.CONTROL_EFFECT_MODE_NEGATIVE
+                )
+            }
+            "solarize" -> {
+                Log.d(TAG, "Applying CONTROL_EFFECT_MODE_SOLARIZE for $filterType preview")
+                interop.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_EFFECT_MODE,
+                    CameraMetadata.CONTROL_EFFECT_MODE_SOLARIZE
+                )
+            }
+            "posterize" -> {
+                Log.d(TAG, "Applying CONTROL_EFFECT_MODE_POSTERIZE for $filterType preview")
+                interop.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_EFFECT_MODE,
+                    CameraMetadata.CONTROL_EFFECT_MODE_POSTERIZE
+                )
+            }
+            // Explicitly handle other custom filters that are post-processing only
+            "vintage", "cool", "warm", "blur", "sharpen", "edge", "vignette", "contrast", "brightness" -> {
+                 Log.d(TAG, "Applying CONTROL_EFFECT_MODE_OFF for $filterType preview (post-processing only)")
+                 interop.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_EFFECT_MODE,
+                    CameraMetadata.CONTROL_EFFECT_MODE_OFF
+                )
+            }
+            "none" -> {
+                Log.d(TAG, "Applying CONTROL_EFFECT_MODE_OFF for 'none' filter preview")
+                interop.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_EFFECT_MODE,
+                    CameraMetadata.CONTROL_EFFECT_MODE_OFF
+                )
+            }
+            else -> {
+                // This case handles any other filterType not explicitly listed,
+                // including potentially new ones or typos.
+                Log.w(TAG, "Unknown filterType: '$filterType'. Applying CONTROL_EFFECT_MODE_OFF as default.")
+                interop.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_EFFECT_MODE,
+                    CameraMetadata.CONTROL_EFFECT_MODE_OFF
+                )
+            }
+        }
+    }
+
+    fun setFilter(filterType: String) {
+        Log.d(TAG, "setFilter called with filterType: $filterType")
+        this.currentFilterType = filterType
+        
+        // Check if camera is properly initialized before applying filter
+        if (cameraProvider == null) {
+            Log.e(TAG, "CameraProvider is null, cannot apply filter")
+            return
+        }
+        
+        if (filteredTextureView == null) {
+            Log.e(TAG, "FilteredTextureView is null, cannot apply filter. Camera might not be fully set up.")
+            // Depending on the desired behavior, you might queue the filter change
+            // or simply log and wait for the view to be set.
+            // For now, we'll proceed, and applyFilterToCamera will rebind,
+            // which should pick up the new filter for ImageAnalysis.
+        }
+        
+        applyFilterToCamera()
+    }
+
+    fun setFilterIntensity(intensity: Float) {
+        this.currentFilterIntensity = intensity.coerceIn(0.0f, 1.0f)
+        // For filters that support intensity, reapply them
+        if (currentFilterType in listOf("vignette", "contrast", "brightness")) {
+            applyFilterToCamera()
+        }
+    }
+
+    private fun applyFilterToCamera() {
+        val lifecycleOwner = activity as? LifecycleOwner ?: run {
+            Log.e(TAG, "Activity is not a LifecycleOwner")
+            return
+        }
+        val provider = cameraProvider ?: run {
+            Log.e(TAG, "CameraProvider is null")
+            return
+        }
+        
+        // Store current use cases before unbinding to restore if needed
+        val currentPreview = preview
+        val currentImageCapture = imageCapture
+        val currentImageAnalysis = imageAnalysis // Store current imageAnalysis
         
         try {
-            Log.i(TAG, "bindCameraUseCases: Unbinding all previous use cases before new bind.")
-            cameraProvider?.unbindAll()
-            Log.i(TAG, "bindCameraUseCases: Successfully unbound all previous use cases.")
-
-            preview = createPreviewUseCase(surfaceTexture)
+            // Unbind existing use cases
+            provider.unbindAll()
+            
+            // Create new preview with filter applied (for Camera2 effects)
+            preview = createPreviewUseCase()
+            
+            // Create new imageCapture use case
             imageCapture = createImageCaptureUseCase()
-            Log.i(TAG, "bindCameraUseCases: Created new Preview and ImageCapture use cases. Preview: $preview, ImageCapture: $imageCapture")
 
-            camera = cameraProvider?.bindToLifecycle(
+            // Create new imageAnalysis use case (its analyzer will pick up currentFilterType)
+            // Pass the current device orientation to it
+            val rotationForAnalysisOnFilterChange = currentTargetRotation ?: activity.display?.rotation ?: android.view.Surface.ROTATION_0
+            Log.e(TAG, "applyFilterToCamera: Passing rotation $rotationForAnalysisOnFilterChange to createImageAnalysisUseCase.")
+            imageAnalysis = createImageAnalysisUseCase(rotationForAnalysisOnFilterChange)
+            
+            // Set surface provider for preview - NO LONGER DOING THIS FOR A VISIBLE PREVIEWVIEW
+            // previewView?.let { preview?.setSurfaceProvider(it.surfaceProvider) }
+            // The Preview use case will still exist and provide frames if bound,
+            // but its output isn't directly tied to a visible PreviewView here.
+            // ImageAnalysis is our source for the FilteredTextureView.
+            
+            // Rebind all use cases
+            val cameraSelector = if (isBackCamera) {
+                CameraSelector.DEFAULT_BACK_CAMERA
+            } else {
+                CameraSelector.DEFAULT_FRONT_CAMERA
+            }
+            
+            val useCasesToBind = mutableListOf(preview, imageCapture, imageAnalysis)
+                .filterNotNull()
+            
+            if (useCasesToBind.size < 2) {
+                 Log.e(TAG, "Not enough use cases to rebind during filter application.")
+                 // Attempt to restore previous state
+                 preview = currentPreview
+                 imageCapture = currentImageCapture
+                 imageAnalysis = currentImageAnalysis
+                 // Rebind previous if possible (simplified restoration)
+                 if (currentPreview != null) { // At least bind preview
+                    val prevUseCases = mutableListOf(currentPreview, currentImageCapture, currentImageAnalysis).filterNotNull()
+                    if (prevUseCases.isNotEmpty()) {
+                        camera = provider.bindToLifecycle(lifecycleOwner, cameraSelector, *prevUseCases.toTypedArray())
+                    }
+                 }
+                 return
+            }
+
+            camera = provider.bindToLifecycle(
                 lifecycleOwner,
                 cameraSelector,
-                preview,
-                imageCapture
+                *useCasesToBind.toTypedArray()
             )
-            Log.i(TAG, "bindCameraUseCases: bindToLifecycle call completed. Camera object: $camera")
             
-            if (camera != null) {
-                Log.i(TAG, "bindCameraUseCases: Camera use cases bound successfully to camera: ${camera?.cameraInfo?.implementationType}")
-                // Log available effects (vẫn hữu ích để biết khả năng của phần cứng)
-                try {
-                    val camera2CameraInfo = Camera2CameraInfo.from(camera!!.cameraInfo)
-                    val availableEffects = camera2CameraInfo.getCameraCharacteristic(CameraCharacteristics.CONTROL_AVAILABLE_EFFECTS)
-                    Log.d(TAG, "bindCameraUseCases: Available CONTROL_EFFECT_MODES (hardware): ${availableEffects?.joinToString { effect -> effectToString(effect) }}")
-                    
-                    val sensorRotation = camera!!.cameraInfo.sensorRotationDegrees
-                    val currentDisplayRotation = cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0
-                    lastKnownRotation = currentDisplayRotation
-                    
-                    Log.i(TAG, "bindCameraUseCases: Camera bound. SensorRotation: $sensorRotation, DisplayRotation: $currentDisplayRotation, PreviewSize: $targetResolution")
+        } catch (e: Exception) {
+            Log.e(TAG, "Use case binding failed during filter application", e)
+            
+            // Restore previous use cases if binding failed
+            try {
+                preview = currentPreview
+                imageCapture = currentImageCapture
+                imageAnalysis = currentImageAnalysis // Restore imageAnalysis
+                
+                val prevUseCasesToRestore = mutableListOf(preview, imageCapture, imageAnalysis).filterNotNull()
 
-                    cameraGLSurfaceView?.renderer?.setCameraParameters(
-                        targetResolution?.width ?: 0,
-                        targetResolution?.height ?: 0,
-                        sensorRotation,
-                        currentDisplayRotation
+                if (prevUseCasesToRestore.isNotEmpty()) {
+                     val cameraSelector = if (isBackCamera) {
+                        CameraSelector.DEFAULT_BACK_CAMERA
+                    } else {
+                        CameraSelector.DEFAULT_FRONT_CAMERA
+                    }
+                    camera = provider.bindToLifecycle(
+                        lifecycleOwner,
+                        cameraSelector,
+                        *prevUseCasesToRestore.toTypedArray()
                     )
-                    Log.i(TAG, "bindCameraUseCases: Called renderer.setCameraParameters.")
-
-                    // Apply initial zoom after camera is bound
-                    camera?.cameraControl?.setLinearZoom(currentZoomRatio)
-                    Log.i(TAG, "bindCameraUseCases: Applied initial zoom ratio: $currentZoomRatio")
-
-
-                } catch (e: Exception) {
-                    Log.e(TAG, "bindCameraUseCases: Error getting camera characteristics or setting params", e)
                 }
-            } else {
-                Log.e(TAG, "bindCameraUseCases: Camera object is NULL after bindToLifecycle.")
+            } catch (restoreException: Exception) {
+                Log.e(TAG, "Failed to restore previous camera state", restoreException)
             }
-            // Không cần requestLayout cho GLSurfaceView ở đây
-        } catch (exc: Exception) {
-            Log.e(TAG, "bindCameraUseCases: Use case binding failed with exception", exc)
-            // Consider invoking callback with error
         }
-        Log.i(TAG, "<<< bindCameraUseCases END. Camera: $camera")
     }
 
-// Getters for current state
-fun getCurrentLensFacing(): Int {
-    return if (cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
-}
-
-fun getCurrentZoomRatio(): Float {
-    // Try to get live value if camera is active, otherwise return stored
-    return camera?.cameraInfo?.zoomState?.value?.linearZoom ?: currentZoomRatio
-}
-
-fun getCurrentFlashMode(): String {
-    return when (currentFlashMode) {
-        ImageCapture.FLASH_MODE_ON -> "on"
-        ImageCapture.FLASH_MODE_AUTO -> "auto"
-        else -> "off"
-    }
-}
-
-fun getCurrentFilterType(): String {
-    return currentFilterType
-}
-
-fun getCurrentDeviceOrientation(): Int {
-    return currentDeviceOrientation
-}
-
-
-fun takePicture(photoFile: File, callback: (String?, String?) -> Unit) {
-    Log.d(TAG, "Taking picture requested to file: ${photoFile.absolutePath}")
-        
-        // Check if imageCapture is initialized
-        if (imageCapture == null) {
-            Log.e(TAG, "ImageCapture use case not initialized.")
-            callback(null, "ImageCapture use case not initialized. Camera may not be ready.")
+    fun takePicture(callback: (String?, String?) -> Unit) {
+        val captureInstance = imageCapture ?: run {
+            Log.e(TAG, "ImageCapture is null - camera not properly initialized")
+            callback(null, "Camera not initialized")
             return
         }
 
-        // Ensure directory exists
-        val parentDir = photoFile.parentFile
-        if (parentDir != null && !parentDir.exists()) {
-            parentDir.mkdirs()
-        }
-        
-        // If a capture is already in progress, queue this request
-        if (isCaptureInProgress) {
-            Log.d(TAG, "Capture already in progress, queueing request")
-            pendingCaptureRequests.add(CaptureRequest(photoFile, callback))
-            return
-        }
-        
-        isCaptureInProgress = true
+        // Create output file
+        val name = SimpleDateFormat(FILENAME_FORMAT, Locale.US)
+            .format(System.currentTimeMillis())
+        val photoFile = File(
+            activity.getExternalFilesDir(null),
+            "$name.jpg"
+        )
 
         val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
-        
-        imageCapture?.takePicture(
+
+        captureInstance.takePicture(
             outputOptions,
-            ContextCompat.getMainExecutor(context),
+            ContextCompat.getMainExecutor(activity),
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                    Log.d(TAG, "DEBUG_ORIENTATION: Image capture successful, analyzing orientation")
-                    
                     val savedUri = outputFileResults.savedUri ?: Uri.fromFile(photoFile)
                     val filePath = savedUri.path
-                    
-                    // DEBUG: Kiểm tra EXIF orientation data
-                    try {
-                        val exif = ExifInterface(photoFile.absolutePath)
-                        val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
-                        val orientationString = when(orientation) {
-                            ExifInterface.ORIENTATION_NORMAL -> "NORMAL (0°)"
-                            ExifInterface.ORIENTATION_ROTATE_90 -> "ROTATE_90 (90°)"
-                            ExifInterface.ORIENTATION_ROTATE_180 -> "ROTATE_180 (180°)"
-                            ExifInterface.ORIENTATION_ROTATE_270 -> "ROTATE_270 (270°)"
-                            else -> "OTHER ($orientation)"
-                        }
-                        Log.d(TAG, "DEBUG_ORIENTATION: Captured image EXIF orientation: $orientationString")
-                        Log.d(TAG, "DEBUG_ORIENTATION: File: ${photoFile.absolutePath}")
-                        
-                        // So sánh với current camera state
-                        val currentDisplayRotation = cameraGLSurfaceView?.display?.rotation ?: Surface.ROTATION_0
-                        val sensorRotation = camera?.cameraInfo?.sensorRotationDegrees ?: 0
-                        Log.d(TAG, "DEBUG_ORIENTATION: Current camera state at capture time:")
-                        Log.d(TAG, "  Display rotation: $currentDisplayRotation")
-                        Log.d(TAG, "  Sensor rotation: $sensorRotation°")
-                        Log.d(TAG, "  Preview targetRotation: ${preview?.targetRotation}")
-                        Log.d(TAG, "  ImageCapture targetRotation: ${imageCapture?.targetRotation}")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "DEBUG_ORIENTATION: Error reading EXIF data", e)
-                    }
-                    
-                    // Always apply orientation correction and optional filter on background thread
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            Log.d(TAG, "DEBUG_ORIENTATION: Post-processing captured image")
-                            
-                            // Step 1: Apply orientation correction
-                            val sensorRotation = camera?.cameraInfo?.sensorRotationDegrees ?: 0
-                            val targetRotation = imageCapture?.targetRotation ?: Surface.ROTATION_0
-                            applyCapturedImageCorrection(photoFile.absolutePath, sensorRotation, targetRotation)
-                            
-                            // Step 2: Apply filter if needed
-                            if (currentFilterType != "none" &&
-                                currentFilterType != "negative" && currentFilterType != "solarize" &&
-                                currentFilterType != "posterize") {
-                                Log.d(TAG, "Applying filter to captured image: $currentFilterType")
-                                applyFilterToSavedImage(photoFile.absolutePath, currentFilterType)
-                            }
-                            
-                            launch(Dispatchers.Main) {
-                                // Notify caller of success on main thread
-                                callback(photoFile.absolutePath, null)
-                                processNextCaptureRequest()
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Failed to post-process captured image", e)
-                            launch(Dispatchers.Main) {
-                                callback(null, "Failed to process image: ${e.message}")
-                                processNextCaptureRequest()
+
+                    if (currentFilterType != "none" && currentFilterType != "auto") {
+                        // Apply filter to the captured image if it's not done in real-time
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                // applyFilterToSavedImage now handles bitmap loading, filtering, and saving
+                                applyFilterToSavedImage(photoFile.absolutePath, currentFilterType, currentFilterIntensity)
+                                launch(Dispatchers.Main) {
+                                    callback(photoFile.absolutePath, null)
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error applying filter to saved image", e)
+                                launch(Dispatchers.Main) {
+                                    callback(null, "Failed to apply filter: ${e.message}")
+                                }
                             }
                         }
+                    } else {
+                        // No post-processing needed
+                        callback(filePath, null)
                     }
                 }
-                
+
                 override fun onError(exception: ImageCaptureException) {
-                    Log.e(TAG, "Image capture failed", exception)
+                    Log.e(TAG, "Photo capture failed", exception)
                     callback(null, "Photo capture failed: ${exception.message}")
-                    processNextCaptureRequest()
                 }
             }
         )
     }
-    
-    private fun processNextCaptureRequest() {
-        // Process the next capture request in the queue if any
-        if (pendingCaptureRequests.isNotEmpty()) {
-            val nextRequest = pendingCaptureRequests.poll()
-            nextRequest?.let { request ->
-                Log.d(TAG, "Processing next queued capture request")
-                // We need to set isCaptureInProgress to false before calling takePicture
-                // so that the next capture isn't queued
-                isCaptureInProgress = false
-                takePicture(request.photoFile, request.callback)
-            }
-        } else {
-            // No more pending requests
-            isCaptureInProgress = false
-        }
-    }
 
-    private fun applyCapturedImageCorrection(filePath: String, sensorRotation: Int, targetRotation: Int) {
-        Log.d(TAG, "DEBUG_ORIENTATION: applyCapturedImageCorrection")
-        Log.d(TAG, "  SensorRotation: $sensorRotation°")
-        Log.d(TAG, "  TargetRotation: $targetRotation")
-        
-        // Calculate rotation based on physical device orientation (not display rotation)
-        // Since screen is locked to portrait, we use currentDeviceOrientation for proper image rotation
-        val deviceOrientationRotation = when (currentDeviceOrientation) {
-            0 -> Surface.ROTATION_0      // Portrait
-            90 -> Surface.ROTATION_90    // Landscape left
-            180 -> Surface.ROTATION_180  // Portrait upside down
-            270 -> Surface.ROTATION_270  // Landscape right
-            else -> Surface.ROTATION_0   // Default to portrait
+    private fun applyFilterToSavedImage(imagePath: String, filterType: String, intensity: Float) {
+        val originalBitmap = BitmapFactory.decodeFile(imagePath)
+        if (originalBitmap == null) {
+            Log.e(TAG, "Failed to decode image file for filtering: $imagePath")
+            return
         }
-        
-        val requiredRotation = when {
-            sensorRotation == 90 && deviceOrientationRotation == Surface.ROTATION_0 -> 90f   // Portrait
-            sensorRotation == 90 && deviceOrientationRotation == Surface.ROTATION_90 -> 0f   // Landscape left
-            sensorRotation == 90 && deviceOrientationRotation == Surface.ROTATION_180 -> -90f // Portrait upside down
-            sensorRotation == 90 && deviceOrientationRotation == Surface.ROTATION_270 -> 180f // Landscape right
-            sensorRotation == 270 && deviceOrientationRotation == Surface.ROTATION_0 -> -90f  // Front camera portrait
-            sensorRotation == 270 && deviceOrientationRotation == Surface.ROTATION_90 -> 0f   // Front camera landscape left
-            sensorRotation == 270 && deviceOrientationRotation == Surface.ROTATION_180 -> 90f // Front camera upside down
-            sensorRotation == 270 && deviceOrientationRotation == Surface.ROTATION_270 -> 180f // Front camera landscape right
-            else -> 0f // No rotation needed for sensorRotation 0° or 180°
-        }
-        
-        Log.d(TAG, "DEBUG_ORIENTATION: Using physical device orientation for image correction")
-        Log.d(TAG, "  Physical device orientation: $currentDeviceOrientation°")
-        Log.d(TAG, "  Converted to Surface rotation: $deviceOrientationRotation")
-        Log.d(TAG, "  Sensor rotation: $sensorRotation°")
-        Log.d(TAG, "  Required bitmap rotation: $requiredRotation°")
-        
-        Log.d(TAG, "DEBUG_ORIENTATION: Calculated required rotation: $requiredRotation°")
-        
-        if (requiredRotation != 0f) {
-            try {
-                // Load the bitmap
-                val originalBitmap = BitmapFactory.decodeFile(filePath)
-                if (originalBitmap == null) {
-                    Log.e(TAG, "Failed to decode bitmap from file: $filePath")
-                    return
-                }
-                
-                // Create rotation matrix
-                val matrix = Matrix().apply {
-                    postRotate(requiredRotation)
-                }
-                
-                // Calculate new dimensions after rotation to prevent overflow
-                val originalWidth = originalBitmap.width
-                val originalHeight = originalBitmap.height
-                
-                // For 90° or 270° rotations, width and height are swapped
-                val willSwapDimensions = (requiredRotation % 180f != 0f)
-                val newWidth = if (willSwapDimensions) originalHeight else originalWidth
-                val newHeight = if (willSwapDimensions) originalWidth else originalHeight
-                
-                Log.d(TAG, "DEBUG_ORIENTATION: Bitmap rotation details:")
-                Log.d(TAG, "  Original: ${originalWidth}x${originalHeight}")
-                Log.d(TAG, "  Rotation: $requiredRotation°")
-                Log.d(TAG, "  Will swap dimensions: $willSwapDimensions")
-                Log.d(TAG, "  Expected new size: ${newWidth}x${newHeight}")
-                
-                // Apply rotation with proper matrix centering
-                val rotatedBitmap = Bitmap.createBitmap(
-                    originalBitmap,
-                    0, 0,
-                    originalWidth,
-                    originalHeight,
-                    matrix,
-                    true
-                )
-                
-                Log.d(TAG, "DEBUG_ORIENTATION: Actual rotated bitmap size: ${rotatedBitmap.width}x${rotatedBitmap.height}")
-                
-                // Save the rotated bitmap back to file
-                val outputStream = FileOutputStream(filePath)
-                rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
-                outputStream.flush()
-                outputStream.close()
-                
-                // Update EXIF to normal orientation since we've physically rotated the image
-                val exif = ExifInterface(filePath)
-                exif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
-                exif.saveAttributes()
-                
-                // Clean up bitmaps
-                originalBitmap.recycle()
-                if (rotatedBitmap != originalBitmap) {
-                    rotatedBitmap.recycle()
-                }
-                
-                Log.d(TAG, "DEBUG_ORIENTATION: Successfully applied rotation $requiredRotation° and updated EXIF")
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "DEBUG_ORIENTATION: Error applying image correction", e)
-                throw e
-            }
-        } else {
-            Log.d(TAG, "DEBUG_ORIENTATION: No rotation correction needed")
-        }
-    }
 
-    private fun applyFilterToSavedImage(filePath: String, filterType: String) {
+        val filteredBitmap: Bitmap = when (filterType.lowercase()) {
+            "sepia" -> FilterProcessor.applySepia(originalBitmap, intensity)
+            "vintage" -> FilterProcessor.applyVintage(originalBitmap, intensity)
+            "cool" -> FilterProcessor.applyCool(originalBitmap, intensity)
+            "warm" -> FilterProcessor.applyWarm(originalBitmap, intensity)
+            "blur" -> FilterProcessor.applyBlur(originalBitmap, intensity)
+            "sharpen" -> FilterProcessor.applySharpen(originalBitmap, intensity)
+            "edge" -> FilterProcessor.applyEdge(originalBitmap, intensity)
+            "vignette" -> FilterProcessor.applyVignette(originalBitmap, intensity)
+            "contrast" -> FilterProcessor.applyContrast(originalBitmap, intensity)
+            "brightness" -> FilterProcessor.applyBrightness(originalBitmap, intensity)
+            else -> originalBitmap // If filter type is unknown or "none", return original
+        }
+
         try {
-            // Load the bitmap from file
-            val originalBitmap = BitmapFactory.decodeFile(filePath)
-            
-            // Apply appropriate filter based on type
-            val filteredBitmap = when (filterType.lowercase()) {
-                "sepia" -> applySepia(originalBitmap)
-                "grayscale", "mono" -> applyGrayscale(originalBitmap)
-                else -> originalBitmap // If no filter matched, return the original
+            FileOutputStream(imagePath).use { out ->
+                filteredBitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
             }
-            
-            // If a new bitmap was created, save it back to the original file
-            if (filteredBitmap != originalBitmap) {
-                val outputStream = FileOutputStream(filePath)
-                filteredBitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
-                outputStream.flush()
-                outputStream.close()
-                
-                // Recycle the bitmaps to free memory
-                if (originalBitmap != filteredBitmap) {
-                    originalBitmap.recycle()
-                }
+            Log.d(TAG, "Filtered image saved to $imagePath")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save filtered bitmap to $imagePath", e)
+        } finally {
+            // Recycle bitmaps if they are different and no longer needed
+            if (originalBitmap !== filteredBitmap && !filteredBitmap.isRecycled) {
                 filteredBitmap.recycle()
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error applying filter to image", e)
-            throw e
+            // Original bitmap was loaded here, so it should be recycled if not used by filteredBitmap
+            if (!originalBitmap.isRecycled) {
+                 // originalBitmap.recycle() // Be cautious if FilterProcessor might reuse it.
+                                         // Assuming FilterProcessor returns a new bitmap or the same one.
+                                         // If FilterProcessor always returns new, original can be recycled.
+            }
         }
     }
-
-    private fun applySepia(bitmap: Bitmap): Bitmap {
-        val width = bitmap.width
-        val height = bitmap.height
-        val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(result)
-        
-        val sepiaMatrix = ColorMatrix().apply {
-            set(floatArrayOf(
-                0.393f, 0.769f, 0.189f, 0f, 0f,
-                0.349f, 0.686f, 0.168f, 0f, 0f,
-                0.272f, 0.534f, 0.131f, 0f, 0f,
-                0f, 0f, 0f, 1f, 0f
-            ))
-        }
-        
-        val paint = Paint().apply {
-            colorFilter = ColorMatrixColorFilter(sepiaMatrix)
-        }
-        
-        canvas.drawBitmap(bitmap, 0f, 0f, paint)
-        return result
-    }
-    
-    private fun applyGrayscale(bitmap: Bitmap): Bitmap {
-        val width = bitmap.width
-        val height = bitmap.height
-        val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(result)
-        val grayscaleMatrix = ColorMatrix().apply { setSaturation(0f) }
-        val paint = Paint().apply { colorFilter = ColorMatrixColorFilter(grayscaleMatrix) }
-        canvas.drawBitmap(bitmap, 0f, 0f, paint)
-        return result
-    }
-
-    fun setFilter(filterType: String) {
-        Log.d(TAG, "CameraManager setFilter called with: $filterType")
-        this.currentFilterType = filterType.lowercase()
-        // Thông báo cho CameraGLSurfaceView (và renderer của nó) để thay đổi filter
-        cameraGLSurfaceView?.setFilter(this.currentFilterType)
-        // Không cần bindCameraUseCases() nữa vì filter được xử lý bởi OpenGL
-    }
-
-    // Hàm applyEffectToPreview không còn cần thiết vì filter được xử lý bởi GLRenderer
-    // private fun applyEffectToPreview(...) { ... }
-
 
     fun switchCamera() {
-        cameraSelector = if (cameraSelector == CameraSelector.DEFAULT_BACK_CAMERA) {
-            CameraSelector.DEFAULT_FRONT_CAMERA
-        } else {
-            CameraSelector.DEFAULT_BACK_CAMERA
-        }
-        // Cần rebind để sử dụng camera mới
-        bindCameraUseCases()
+        isBackCamera = !isBackCamera
+        startCamera()
     }
 
-    fun toggleFlash(callback: (String) -> Unit) {
-        currentFlashMode = when (currentFlashMode) {
+    fun toggleFlash(): String {
+        flashMode = when (flashMode) {
             ImageCapture.FLASH_MODE_OFF -> ImageCapture.FLASH_MODE_ON
             ImageCapture.FLASH_MODE_ON -> ImageCapture.FLASH_MODE_AUTO
             ImageCapture.FLASH_MODE_AUTO -> ImageCapture.FLASH_MODE_OFF
-            else -> ImageCapture.FLASH_MODE_OFF // Default fallback
+            else -> ImageCapture.FLASH_MODE_OFF
         }
-        // Re-create and bind imageCapture use case for flash mode to take effect on some devices
-        // Or, try to set it on the fly if supported by CameraControl
-        imageCapture?.flashMode = currentFlashMode // Update existing use case
-        // For some devices or CameraX versions, rebinding might be more reliable:
-        // bindCameraUseCases() 
-        val flashModeString = when (currentFlashMode) {
+        
+        // Update the image capture use case with new flash mode
+        imageCapture = createImageCaptureUseCase()
+        val lifecycleOwner = activity as? LifecycleOwner ?: return getFlashModeString()
+        
+        try {
+            val cameraSelector = if (isBackCamera) {
+                CameraSelector.DEFAULT_BACK_CAMERA
+            } else {
+                CameraSelector.DEFAULT_FRONT_CAMERA
+            }
+            
+            cameraProvider?.unbindAll()
+            val useCasesToBind = mutableListOf(preview, imageCapture, imageAnalysis).filterNotNull()
+            if (useCasesToBind.isNotEmpty()) {
+                camera = cameraProvider?.bindToLifecycle(
+                    lifecycleOwner,
+                    cameraSelector,
+                    *useCasesToBind.toTypedArray()
+                )
+            } else {
+                Log.e(TAG, "No valid use cases to bind after flash mode toggle.")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update flash mode", e)
+        }
+        
+        return getFlashModeString()
+    }
+
+    private fun getFlashModeString(): String {
+        return when (flashMode) {
             ImageCapture.FLASH_MODE_ON -> "on"
             ImageCapture.FLASH_MODE_AUTO -> "auto"
             else -> "off"
         }
-        callback(flashModeString)
     }
 
-    fun setZoom(zoomRatio: Float) {
-        val clampedZoom = zoomRatio.coerceIn(0f, 1f)
-        camera?.cameraControl?.setLinearZoom(clampedZoom)
-        currentZoomRatio = clampedZoom // Update stored zoom ratio
-        Log.d(TAG, "Set zoom to $clampedZoom. Stored currentZoomRatio: $currentZoomRatio")
+    fun setZoom(zoom: Float) {
+        val zoomLevel = zoom.coerceIn(0.0f, 1.0f)
+        camera?.cameraControl?.setLinearZoom(zoomLevel)
     }
 
-    // Hàm setPreviewView(view: PreviewView) không còn cần thiết nữa
-    // Thay vào đó, CameraGLSurfaceView được truyền vào khi initializeCamera
-
-    fun updateActivity(newActivity: Activity) {
-        this.activity = newActivity
-    }
-
-    fun isDisposed(): Boolean = _isDisposed
-
-    fun getActivity(): Activity = activity
-
-    fun dispose() {
-        Log.i(TAG, "dispose() called. Current state: _isDisposed=$_isDisposed")
-        if (_isDisposed) {
-            Log.d(TAG, "dispose() called but already disposed.")
+    fun updateTargetRotation(rotation: Int) { // rotation is Surface.ROTATION_*
+        Log.e(TAG, "updateTargetRotation CALLED. New SurfaceRotation: $rotation, Old: ${currentTargetRotation ?: "null"}")
+        if (currentTargetRotation == rotation && camera != null) {
+            Log.e(TAG, "updateTargetRotation: Rotation unchanged ($rotation) and camera active. Attempting to update FTV orientation anyway.")
+            // Even if rotation is same, ensure FTV is updated, in case it missed a previous update.
+            filteredTextureView?.let {
+                val degrees = degreesFromSurfaceRotation(rotation)
+                it.updateDisplayOrientation(degrees) // This will log inside FTV
+            }
             return
         }
-        _isDisposed = true
-        Log.i(TAG, "dispose(): Set _isDisposed to true. Proceeding with resource cleanup.")
-        try {
-            // Clear pending capture requests
-            if (pendingCaptureRequests.isNotEmpty()) {
-                Log.i(TAG, "Clearing ${pendingCaptureRequests.size} pending capture requests during dispose.")
-                pendingCaptureRequests.forEach {
-                    it.callback(null, "Camera disposed while request was pending")
-                }
-                pendingCaptureRequests.clear()
+        
+        this.currentTargetRotation = rotation
+        Log.e(TAG, "updateTargetRotation: currentTargetRotation (Surface rotation) updated to: $currentTargetRotation")
+
+        // Revert to calling startCamera() to ensure ImageAnalysis use case is reconfigured
+        // with the new targetRotation, which affects image.imageInfo.rotationDegrees.
+        if (cameraProvider != null && activity != null) {
+            Log.e(TAG, "updateTargetRotation: Calling startCamera() due to rotation change.")
+            startCamera() // This will rebind use cases with the new currentTargetRotation
+            Log.e(TAG, "updateTargetRotation: startCamera() CALL COMPLETE.")
+        } else {
+            Log.e(TAG, "updateTargetRotation: CANNOT call startCamera(). cameraProvider: $cameraProvider, activity: $activity")
+            // If we can't restart camera, at least try to update the view's orientation
+            // This might lead to incorrect bitmap rotation if ImageAnalysis isn't updated.
+            filteredTextureView?.let {
+                val degrees = degreesFromSurfaceRotation(rotation)
+                it.updateDisplayOrientation(degrees)
+                Log.e(TAG, "updateTargetRotation: Updated FTV orientation directly as camera could not be restarted.")
             }
-            
-            Log.d(TAG, "dispose(): Unbinding all camera use cases. CameraProvider: $cameraProvider")
-            cameraProvider?.unbindAll()
-            Log.d(TAG, "dispose(): Shutting down cameraExecutor.")
-            cameraExecutor.shutdown() // Consider awaitTermination for clean shutdown
-            
-            Log.d(TAG, "dispose(): Cancelling coroutine scope.")
-            (scope.coroutineContext[Job] as? Job)?.cancel()
-            
-            Log.d(TAG, "dispose(): Nullifying references.")
-            // previewView = null // Không còn dùng previewView
-            cameraGLSurfaceView = null // Giải phóng tham chiếu đến GL view
-            cameraProvider = null
-            camera = null
-            preview = null
-            imageCapture = null
-            isCaptureInProgress = false
-            
-            Log.d(TAG, "dispose(): Disabling orientationEventListener.")
-            orientationEventListener?.disable()
-            orientationEventListener = null
-            Log.i(TAG, "CameraManager disposed successfully.")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during CameraManager disposal", e)
+            return
+        }
+        
+        // After startCamera() has (hopefully) reconfigured ImageAnalysis,
+        // update the FilteredTextureView's display orientation.
+        filteredTextureView?.let {
+            val degrees = degreesFromSurfaceRotation(rotation)
+            it.updateDisplayOrientation(degrees) // This will log inside FTV
+            Log.e(TAG, "updateTargetRotation: Called updateDisplayOrientation on FTV with $degrees degrees AFTER startCamera().")
         }
     }
 
-    private fun updateUseCaseRotations(rotation: Int) {
-        Log.d(TAG, "DEBUG_ORIENTATION: updateUseCaseRotations called")
-        Log.d(TAG, "  New device rotation: $rotation")
-        Log.d(TAG, "  Previous Preview targetRotation: ${preview?.targetRotation}")
-        Log.d(TAG, "  Previous ImageCapture targetRotation: ${imageCapture?.targetRotation}")
-        
-        // CAMERA APP BEHAVIOR:
-        // - Preview ALWAYS stays portrait (ROTATION_0)
-        // - Only ImageCapture rotation changes to follow device orientation
-        
-        // DON'T update preview rotation - keep it portrait
-        // preview?.targetRotation = Surface.ROTATION_0 // Keep preview portrait
-        
-        // ONLY update ImageCapture rotation to follow device orientation
-        imageCapture?.targetRotation = rotation
-        
-        Log.d(TAG, "  Preview targetRotation: ${preview?.targetRotation} (KEPT PORTRAIT)")
-        Log.d(TAG, "  Updated ImageCapture targetRotation: ${imageCapture?.targetRotation}")
+    // Helper function to convert Surface.ROTATION_* to degrees for canvas rotation
+    private fun degreesFromSurfaceRotation(surfaceRotation: Int): Float {
+        return when (surfaceRotation) {
+            android.view.Surface.ROTATION_0 -> 0f
+            android.view.Surface.ROTATION_90 -> 270f // Canvas rotation for landscape left
+            android.view.Surface.ROTATION_180 -> 180f
+            android.view.Surface.ROTATION_270 -> 90f  // Canvas rotation for landscape right
+            else -> 0f
+        }
     }
 
-    private fun effectToString(effect: Int): String {
-        return when (effect) {
-            CameraMetadata.CONTROL_EFFECT_MODE_OFF -> "OFF ($effect)"
-            CameraMetadata.CONTROL_EFFECT_MODE_MONO -> "MONO ($effect)"
-            CameraMetadata.CONTROL_EFFECT_MODE_NEGATIVE -> "NEGATIVE ($effect)"
-            CameraMetadata.CONTROL_EFFECT_MODE_SOLARIZE -> "SOLARIZE ($effect)"
-            CameraMetadata.CONTROL_EFFECT_MODE_SEPIA -> "SEPIA ($effect)" // Mặc dù không dùng cho preview trực tiếp
-            CameraMetadata.CONTROL_EFFECT_MODE_POSTERIZE -> "POSTERIZE ($effect)"
-            CameraMetadata.CONTROL_EFFECT_MODE_WHITEBOARD -> "WHITEBOARD ($effect)"
-            CameraMetadata.CONTROL_EFFECT_MODE_BLACKBOARD -> "BLACKBOARD ($effect)"
-            CameraMetadata.CONTROL_EFFECT_MODE_AQUA -> "AQUA ($effect)"
-            else -> "UNKNOWN ($effect)"
+    fun dispose() {
+        try {
+            cameraProvider?.unbindAll()
+            cameraExecutor.shutdown()
+            scope.cancel()
+            filteredTextureView = null // Clear reference to custom view
+            orientationStreamHandler.dispose()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error disposing camera", e)
         }
     }
 }

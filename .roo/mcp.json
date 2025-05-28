@@ -23,6 +23,13 @@
         "@modelcontextprotocol/server-filesystem",
         "/Users/tunt/Workspace/Flutter/beauty_camera_plugin"
       ]
+    },
+    "memory": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ]
     }
   }
 }
