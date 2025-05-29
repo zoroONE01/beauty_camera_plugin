@@ -15,6 +15,11 @@ class BeautyCameraController extends ChangeNotifier {
   double _currentZoomLevel = 0.0;
   OrientationData? _currentOrientationData;
 
+  double _currentFilterIntensity = 1.0;
+  bool _showFilterIntensity = false;
+  double _currentExposure = 0.0;
+  bool _isAutoFocusEnabled = true;
+
   // Method channel and event channel from platform interface
   final BeautyCameraPluginPlatform _platform =
       BeautyCameraPluginPlatform.instance;
@@ -27,6 +32,10 @@ class BeautyCameraController extends ChangeNotifier {
   CameraFilter get currentFilter => _currentFilter;
   double get currentZoomLevel => _currentZoomLevel;
   OrientationData? get currentOrientationData => _currentOrientationData;
+  double get currentFilterIntensity => _currentFilterIntensity;
+  bool get showFilterIntensity => _showFilterIntensity;
+  double get currentExposure => _currentExposure;
+  bool get isAutoFocusEnabled => _isAutoFocusEnabled;
 
   Future<void> _init() async {
     // Listen to orientation changes
@@ -87,6 +96,7 @@ class BeautyCameraController extends ChangeNotifier {
     try {
       await _platform.setFilterEnum(filter);
       _currentFilter = filter;
+      _showFilterIntensity = filter != CameraFilter.none && filter.supportsIntensity;
       _lastErrorMessage = null;
     } catch (e) {
       _lastErrorMessage = 'Failed to set filter: $e';
@@ -103,9 +113,50 @@ class BeautyCameraController extends ChangeNotifier {
     }
     try {
       await _platform.setFilterIntensity(intensity);
+      _currentFilterIntensity = intensity;
       _lastErrorMessage = null;
     } catch (e) {
       _lastErrorMessage = 'Failed to set filter intensity: $e';
+    }
+    notifyListeners();
+  }
+
+  Future<void> setExposure(double exposure) async {
+    if (!_isCameraInitialized || _isDisposed) return;
+    if (exposure < -2.0 || exposure > 2.0) {
+      _lastErrorMessage = 'Exposure must be between -2.0 and 2.0';
+      notifyListeners();
+      return;
+    }
+    try {
+      await _platform.setExposure(exposure);
+      _currentExposure = exposure;
+      _lastErrorMessage = null;
+    } catch (e) {
+      _lastErrorMessage = 'Failed to set exposure: $e';
+    }
+    notifyListeners();
+  }
+
+  Future<void> setFocusPoint(double x, double y) async {
+    if (!_isCameraInitialized || _isDisposed) return;
+    try {
+      await _platform.setFocusPoint(x, y);
+      _lastErrorMessage = null;
+    } catch (e) {
+      _lastErrorMessage = 'Failed to set focus point: $e';
+    }
+    notifyListeners();
+  }
+
+  Future<void> setAutoFocus(bool enabled) async {
+    if (!_isCameraInitialized || _isDisposed) return;
+    try {
+      await _platform.setAutoFocus(enabled);
+      _isAutoFocusEnabled = enabled;
+      _lastErrorMessage = null;
+    } catch (e) {
+      _lastErrorMessage = 'Failed to set auto focus: $e';
     }
     notifyListeners();
   }
@@ -172,17 +223,6 @@ class BeautyCameraController extends ChangeNotifier {
       _lastErrorMessage = null;
     } catch (e) {
       _lastErrorMessage = 'Failed to set zoom: $e';
-    }
-    notifyListeners();
-  }
-
-  Future<void> updateCameraRotation(CameraOrientation rotation) async {
-    if (!_isCameraInitialized || _isDisposed) return;
-    try {
-      await _platform.updateCameraRotation(rotation);
-      _lastErrorMessage = null;
-    } catch (e) {
-      _lastErrorMessage = 'Failed to update camera rotation: $e';
     }
     notifyListeners();
   }

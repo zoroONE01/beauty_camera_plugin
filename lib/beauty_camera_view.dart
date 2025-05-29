@@ -61,11 +61,18 @@ class _BeautyCameraViewState extends State<BeautyCameraView> {
 
     // This is where the native camera preview will be rendered.
     // The viewType must match the one registered in the native Android code.
-    return const AndroidView(
-      viewType: 'com.example/camera_preview_view',
-      creationParamsCodec: StandardMessageCodec(),
-      // creationParams can be used to pass initial parameters to the native view if needed.
-      // creationParams: <String, dynamic>{},
+    // Preview orientation is locked and will not auto-rotate with device.
+    return Container(
+      // Wrap AndroidView in Container to provide additional layout constraints
+      alignment: Alignment.center,
+      child: const AndroidView(
+        viewType: 'com.example/camera_preview_view',
+        creationParamsCodec: StandardMessageCodec(),
+        // Lock the preview orientation by using a fixed layout direction
+        layoutDirection: TextDirection.ltr,
+        // creationParams can be used to pass initial parameters to the native view if needed.
+        // creationParams: <String, dynamic>{},
+      ),
     );
   }
 }

@@ -37,6 +37,8 @@ flutter:
       android:
         package: com.example.beauty_camera_plugin
         pluginClass: BeautyCameraPlugin
+      ios:
+        pluginClass: BeautyCameraPlugin
 
   # To add assets to your plugin package, add an assets section, like this:
   # assets:

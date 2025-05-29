@@ -52,6 +52,21 @@ class MethodChannelBeautyCameraPlugin extends BeautyCameraPluginPlatform {
   }
 
   @override
+  Future<void> setExposure(double exposure) async {
+    await methodChannel.invokeMethod<void>('setExposure', {'exposure': exposure});
+  }
+
+  @override
+  Future<void> setFocusPoint(double x, double y) async {
+    await methodChannel.invokeMethod<void>('setFocusPoint', {'x': x, 'y': y});
+  }
+
+  @override
+  Future<void> setAutoFocus(bool enabled) async {
+    await methodChannel.invokeMethod<void>('setAutoFocus', {'enabled': enabled});
+  }
+
+  @override
   Future<void> switchCamera() async {
     await methodChannel.invokeMethod<void>('switchCamera');
   }
@@ -114,14 +129,5 @@ class MethodChannelBeautyCameraPlugin extends BeautyCameraPluginPlatform {
           }
         });
     return _orientationStream!;
-  }
-
-  @override
-  Future<void> updateCameraRotation(CameraOrientation rotation) async {
-    try {
-      await methodChannel.invokeMethod<void>('updateCameraRotation', {'rotation': rotation.degrees});
-    } catch (e) {
-      rethrow;
-    }
   }
 }

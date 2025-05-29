@@ -124,6 +124,17 @@ class OrientationStreamHandler(private val activity: Activity) : EventChannel.St
         }
     }
 
+    fun getCurrentDeviceOrientation(): Int {
+        val display = activity.windowManager.defaultDisplay
+        return when (display.rotation) {
+            Surface.ROTATION_0 -> 0
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+    }
+
     fun dispose() {
         stopOrientationUpdates()
         scope.cancel()

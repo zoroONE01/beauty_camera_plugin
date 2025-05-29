@@ -5,6 +5,31 @@ import 'beauty_camera_plugin_method_channel.dart';
 /// Enum for flash modes, mirroring potential native enums or states.
 enum FlashMode { off, on, auto }
 
+/// Enum for video recording states
+enum VideoRecordingState {
+  idle,
+  recording,
+  paused,
+  stopping,
+}
+
+/// Video quality settings for recording
+enum VideoQuality {
+  low(480, 720, 1000000), // 480p, 1Mbps
+  medium(720, 1280, 2500000), // 720p, 2.5Mbps  
+  high(1080, 1920, 5000000), // 1080p, 5Mbps
+  ultraHigh(2160, 3840, 10000000); // 4K, 10Mbps
+
+  const VideoQuality(this.height, this.width, this.bitrate);
+  
+  final int height;
+  final int width;  
+  final int bitrate; // bits per second
+  
+  @override
+  String toString() => '${width}x$height';
+}
+
 /// Enhanced CameraFilter enum with new advanced filters
 enum CameraFilter {
   // Basic filters
@@ -208,6 +233,23 @@ abstract class BeautyCameraPluginPlatform extends PlatformInterface {
     throw UnimplementedError('setFilterIntensity() has not been implemented.');
   }
 
+  /// Set manual exposure compensation.
+  /// [exposure] should be between -2.0 and 2.0, where 0.0 is auto.
+  Future<void> setExposure(double exposure) {
+    throw UnimplementedError('setExposure() has not been implemented.');
+  }
+
+  /// Set manual focus point.
+  /// [x] and [y] should be between 0.0 and 1.0 (normalized coordinates).
+  Future<void> setFocusPoint(double x, double y) {
+    throw UnimplementedError('setFocusPoint() has not been implemented.');
+  }
+
+  /// Enable or disable auto focus.
+  Future<void> setAutoFocus(bool enabled) {
+    throw UnimplementedError('setAutoFocus() has not been implemented.');
+  }
+
   Future<void> switchCamera() {
     throw UnimplementedError('switchCamera() has not been implemented.');
   }
@@ -226,12 +268,35 @@ abstract class BeautyCameraPluginPlatform extends PlatformInterface {
     throw UnimplementedError('dispose() has not been implemented.');
   }
 
+  /// Video recording methods
+  
+  /// Start video recording with optional quality settings
+  Future<void> startVideoRecording({VideoQuality quality = VideoQuality.high}) {
+    throw UnimplementedError('startVideoRecording() has not been implemented.');
+  }
+
+  /// Stop video recording and return the file path
+  Future<String?> stopVideoRecording() {
+    throw UnimplementedError('stopVideoRecording() has not been implemented.');
+  }
+
+  /// Pause video recording (if supported by platform)
+  Future<void> pauseVideoRecording() {
+    throw UnimplementedError('pauseVideoRecording() has not been implemented.');
+  }
+
+  /// Resume video recording (if supported by platform)  
+  Future<void> resumeVideoRecording() {
+    throw UnimplementedError('resumeVideoRecording() has not been implemented.');
+  }
+
+  /// Get current video recording state
+  Future<VideoRecordingState> getVideoRecordingState() {
+    throw UnimplementedError('getVideoRecordingState() has not been implemented.');
+  }
+
   /// Stream of orientation changes
   Stream<OrientationData> get orientationStream {
     throw UnimplementedError('orientationStream has not been implemented.');
-  }
-
-  Future<void> updateCameraRotation(CameraOrientation rotation) {
-    throw UnimplementedError('updateCameraRotation() has not been implemented.');
   }
 }

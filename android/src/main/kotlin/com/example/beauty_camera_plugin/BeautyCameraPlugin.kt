@@ -28,19 +28,7 @@ class BeautyCameraPlugin: FlutterPlugin, MethodCallHandler, ActivityAware {
   private var cameraManager: CameraManager? = null
   private var currentPlatformView: CameraPlatformView? = null
 
-  // Helper to convert degrees to Surface.ROTATION_* constants
-  private fun getSurfaceRotationFromDegrees(degrees: Int): Int {
-    return when (degrees) {
-        0 -> Surface.ROTATION_0
-        90 -> Surface.ROTATION_90
-        180 -> Surface.ROTATION_180
-        270 -> Surface.ROTATION_270
-        else -> {
-            android.util.Log.w("BeautyCameraPlugin", "Invalid degrees ($degrees) for surface rotation. Defaulting to ROTATION_0.")
-            Surface.ROTATION_0
-        }
-    }
-  }
+
 
   override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
     channel = MethodChannel(flutterPluginBinding.binaryMessenger, "com.example/beauty_camera_plugin")
@@ -143,32 +131,41 @@ class BeautyCameraPlugin: FlutterPlugin, MethodCallHandler, ActivityAware {
         }
       }
       
+      "setExposure" -> {
+        val exposure = call.argument<Double>("exposure")
+        if (exposure != null) {
+          manager!!.setExposure(exposure.toFloat())
+          result.success(null)
+        } else {
+          result.error("INVALID_ARGUMENT", "Exposure value is required", null)
+        }
+      }
+      
+      "setFocusPoint" -> {
+        val x = call.argument<Double>("x")
+        val y = call.argument<Double>("y")
+        if (x != null && y != null) {
+          manager!!.setFocusPoint(x.toFloat(), y.toFloat())
+          result.success(null)
+        } else {
+          result.error("INVALID_ARGUMENT", "Focus point x and y are required", null)
+        }
+      }
+      
+      "setAutoFocus" -> {
+        val enabled = call.argument<Boolean>("enabled")
+        if (enabled != null) {
+          manager!!.setAutoFocus(enabled)
+          result.success(null)
+        } else {
+          result.error("INVALID_ARGUMENT", "Auto focus enabled flag is required", null)
+        }
+      }
+      
       "dispose" -> {
         manager!!.dispose()
         cameraManager = null
         result.success(null)
-      }
-      "updateCameraRotation" -> {
-        val rotation = call.argument<Int>("rotation")
-        // Use a consistent TAG for logging if you define one for the class, otherwise use a string.
-        val TAG_BCP = "BeautyCameraPlugin" // Or use a class-level TAG
-        val rotationDegrees = call.argument<Int>("rotation") // This is 0, 90, 180, 270
-        android.util.Log.d(TAG_BCP, "onMethodCall: 'updateCameraRotation' received. Rotation DEGREES from Flutter: $rotationDegrees. Current cameraManager: $cameraManager, manager var: $manager")
-        
-        if (rotationDegrees != null) {
-          if (manager != null) { // 'manager' is a local val copy of cameraManager
-            val surfaceRotation = getSurfaceRotationFromDegrees(rotationDegrees) // Convert degrees to Surface.ROTATION_*
-            android.util.Log.d(TAG_BCP, "onMethodCall 'updateCameraRotation': Converted $rotationDegrees degrees to SurfaceRotation: $surfaceRotation. Calling manager.updateTargetRotation().")
-            manager.updateTargetRotation(surfaceRotation) // Pass Surface.ROTATION_* constant
-            result.success(null)
-          } else {
-            android.util.Log.e(TAG_BCP, "onMethodCall 'updateCameraRotation': 'manager' (cameraManager) is null. Cannot update rotation.")
-            result.error("NOT_INITIALIZED", "CameraManager is null, cannot update rotation.", null)
-          }
-        } else {
-          android.util.Log.e(TAG_BCP, "onMethodCall 'updateCameraRotation': Rotation degrees argument from Flutter is null.")
-          result.error("INVALID_ARGUMENT", "Rotation argument (degrees) is missing or invalid", null)
-        }
       }
       else -> {
         result.notImplemented()

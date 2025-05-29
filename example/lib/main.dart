@@ -1,12 +1,16 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:beauty_camera_plugin/beauty_camera_plugin.dart';
 import 'package:permission_handler/permission_handler.dart';
-// import 'package:path_provider/path_provider.dart'; // For saving files, if needed by example
+import 'dart:io';
+import 'dart:math' as math;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Lock orientation to portrait only - prevent rotation
+  SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+
   runApp(const MyApp());
 }
 
@@ -35,6 +39,15 @@ class MyApp extends StatelessWidget {
       themeMode: ThemeMode.dark, // Force dark theme for camera app
       home: const CameraScreen(),
       debugShowCheckedModeBanner: false,
+      // Lock orientation to prevent auto-rotation
+      builder: (context, child) {
+        return MediaQuery(
+          data: MediaQuery.of(
+            context,
+          ).copyWith(textScaler: const TextScaler.linear(1.0)),
+          child: child!,
+        );
+      },
     );
   }
 }
@@ -43,7 +56,7 @@ class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
 
   @override
-  _CameraScreenState createState() => _CameraScreenState();
+  State<CameraScreen> createState() => _CameraScreenState();
 }
 
 class _CameraScreenState extends State<CameraScreen>
@@ -53,11 +66,20 @@ class _CameraScreenState extends State<CameraScreen>
   bool _isCapturing = false;
   String? _lastCapturedImagePath;
   bool _showFilterSelector = false;
-  double _currentFilterIntensity = 0.5; // Default intensity
+  double _currentFilterIntensity = 1.0;
+  bool _showManualControls = false;
+  double _currentExposure = 0.0;
+
+  // Add orientation tracking for UI rotation while keeping screen locked
+  CameraOrientation _deviceOrientation = CameraOrientation.portraitUp;
 
   @override
   void initState() {
     super.initState();
+
+    // Enforce portrait orientation lock for screen
+    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+
     WidgetsBinding.instance.addObserver(this);
     _cameraController = BeautyCameraController();
     _cameraController.addListener(_onControllerUpdate);
@@ -67,15 +89,32 @@ class _CameraScreenState extends State<CameraScreen>
   void _onControllerUpdate() {
     if (mounted) {
       setState(() {
-        // Update UI based on controller state changes
-        if (_cameraController.lastErrorMessage != null) {
-          // Optionally show a snackbar or log errors
-          // ScaffoldMessenger.of(context).showSnackBar(
-          //   SnackBar(content: Text(_cameraController.lastErrorMessage!)),
-          // );
+        // Update device orientation tracking for UI rotation
+        if (_cameraController.currentOrientationData != null) {
+          _deviceOrientation =
+              _cameraController.currentOrientationData!.deviceOrientation;
         }
       });
     }
+  }
+
+  // Calculate rotation angle for UI elements based on device orientation
+  double _getUIRotationAngle() {
+    switch (_deviceOrientation) {
+      case CameraOrientation.portraitUp:
+        return 0.0;
+      case CameraOrientation.landscapeLeft:
+        return math.pi / 2; // 90 degrees
+      case CameraOrientation.portraitDown:
+        return math.pi; // 180 degrees
+      case CameraOrientation.landscapeRight:
+        return -math.pi / 2; // -90 degrees
+    }
+  }
+
+  // Helper to build UI elements that rotate with device orientation
+  Widget _buildRotatedUIElement(Widget child) {
+    return Transform.rotate(angle: _getUIRotationAngle(), child: child);
   }
 
   Future<void> _requestPermissionsAndInitialize() async {
@@ -92,11 +131,13 @@ class _CameraScreenState extends State<CameraScreen>
         _permissionsGranted = false;
       });
       // Show a message or handle permission denial
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Camera permission is required to use the camera.'),
-        ),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Camera permission is required to use the camera.'),
+          ),
+        );
+      }
     }
   }
 
@@ -135,9 +176,11 @@ class _CameraScreenState extends State<CameraScreen>
         _showPhotoPreviewDialog(imagePath);
       }
     } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Failed to take picture: $e')));
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Failed to take picture: $e')));
+      }
     } finally {
       setState(() {
         _isCapturing = false;
@@ -204,6 +247,34 @@ class _CameraScreenState extends State<CameraScreen>
     await _cameraController.setZoom(zoom);
   }
 
+  Future<void> _setExposure(double exposure) async {
+    setState(() {
+      _currentExposure = exposure;
+    });
+    await _cameraController.setExposure(exposure);
+  }
+
+  Future<void> _onTapToFocus(TapUpDetails details) async {
+    final RenderBox? renderBox = context.findRenderObject() as RenderBox?;
+    if (renderBox == null) return;
+
+    final size = renderBox.size;
+    final x = details.localPosition.dx / size.width;
+    final y = details.localPosition.dy / size.height;
+
+    // Clamp values between 0.0 and 1.0
+    final clampedX = x.clamp(0.0, 1.0);
+    final clampedY = y.clamp(0.0, 1.0);
+
+    await _cameraController.setFocusPoint(clampedX, clampedY);
+  }
+
+  void _toggleManualControls() {
+    setState(() {
+      _showManualControls = !_showManualControls;
+    });
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -243,9 +314,15 @@ class _CameraScreenState extends State<CameraScreen>
       body: SafeArea(
         child: Stack(
           children: [
-            Positioned.fill(child: _buildCameraPreview()),
+            // Camera preview with tap-to-focus
+            Positioned.fill(
+              child: GestureDetector(
+                onTapUp: _onTapToFocus,
+                child: _buildCameraPreview(),
+              ),
+            ),
 
-            // Error Messages from controller (alternative to snackbar)
+            // Error Messages
             if (_cameraController.lastErrorMessage != null &&
                 _cameraController.isCameraInitialized)
               Positioned(
@@ -255,7 +332,7 @@ class _CameraScreenState extends State<CameraScreen>
                 child: Container(
                   padding: const EdgeInsets.all(8),
                   decoration: BoxDecoration(
-                    color: Colors.red.withOpacity(0.7),
+                    color: Colors.red.withValues(alpha: 0.7),
                     borderRadius: BorderRadius.circular(4),
                   ),
                   child: Text(
@@ -277,9 +354,10 @@ class _CameraScreenState extends State<CameraScreen>
                   children: [
                     Container(
                       height: 100,
-                      color: Colors.black.withOpacity(0.7),
+                      color: Colors.black.withValues(alpha: 0.7),
                       child: ListView.separated(
-                        separatorBuilder: (context, index) => const SizedBox(width: 8),
+                        separatorBuilder:
+                            (context, index) => const SizedBox(width: 8),
                         scrollDirection: Axis.horizontal,
                         padding: const EdgeInsets.symmetric(
                           horizontal: 12,
@@ -292,6 +370,7 @@ class _CameraScreenState extends State<CameraScreen>
                             name: filter.displayName,
                             filter: filter,
                             currentFilter: _cameraController.currentFilter,
+                            rotation: _getUIRotationAngle(),
                             onPressed: (selectedFilter) {
                               _setFilter(selectedFilter);
                             },
@@ -302,7 +381,7 @@ class _CameraScreenState extends State<CameraScreen>
                     if (_cameraController.currentFilter.supportsIntensity)
                       Container(
                         height: 50,
-                        color: Colors.black.withOpacity(0.7),
+                        color: Colors.black.withValues(alpha: 0.7),
                         padding: const EdgeInsets.symmetric(horizontal: 16.0),
                         child: Row(
                           children: [
@@ -328,6 +407,87 @@ class _CameraScreenState extends State<CameraScreen>
                 ),
               ),
 
+            // Manual controls panel
+            if (_showManualControls)
+              Positioned(
+                bottom: 260,
+                left: 0,
+                right: 0,
+                child: Container(
+                  height: 120,
+                  color: Colors.black.withValues(alpha: 0.8),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16.0,
+                    vertical: 8.0,
+                  ),
+                  child: Column(
+                    children: [
+                      // Exposure control
+                      Row(
+                        children: [
+                          _buildRotatedUIElement(
+                            const Icon(
+                              Icons.exposure,
+                              color: Colors.white,
+                              size: 20,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          const Text(
+                            'Exposure',
+                            style: TextStyle(color: Colors.white, fontSize: 12),
+                          ),
+                          Expanded(
+                            child: Slider(
+                              value: _currentExposure,
+                              min: -2.0,
+                              max: 2.0,
+                              divisions: 40,
+                              onChanged: _setExposure,
+                              activeColor: Colors.blue,
+                              inactiveColor: Colors.white30,
+                              label: _currentExposure.toStringAsFixed(1),
+                            ),
+                          ),
+                          Text(
+                            _currentExposure.toStringAsFixed(1),
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                      // Auto focus toggle
+                      Row(
+                        children: [
+                          _buildRotatedUIElement(
+                            const Icon(
+                              Icons.center_focus_strong,
+                              color: Colors.white,
+                              size: 20,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          const Text(
+                            'Auto Focus',
+                            style: TextStyle(color: Colors.white, fontSize: 12),
+                          ),
+                          const Spacer(),
+                          Switch(
+                            value: _cameraController.isAutoFocusEnabled,
+                            onChanged: (value) async {
+                              await _cameraController.setAutoFocus(value);
+                            },
+                            activeColor: Colors.blue,
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
             // Camera controls UI
             Positioned(
               bottom: 0,
@@ -339,23 +499,25 @@ class _CameraScreenState extends State<CameraScreen>
                   horizontal: 16,
                   vertical: 8,
                 ),
-                color: Colors.black.withOpacity(0.5),
+                color: Colors.black.withValues(alpha: 0.5),
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    IconButton(
-                      icon: Icon(
-                        Icons.filter_vintage,
-                        color:
-                            _showFilterSelector ? Colors.amber : Colors.white,
-                        size: 30,
+                    _buildRotatedUIElement(
+                      IconButton(
+                        icon: Icon(
+                          Icons.filter_vintage,
+                          color:
+                              _showFilterSelector ? Colors.amber : Colors.white,
+                          size: 30,
+                        ),
+                        onPressed: () {
+                          setState(() {
+                            _showFilterSelector = !_showFilterSelector;
+                          });
+                        },
+                        tooltip: 'Filters',
                       ),
-                      onPressed: () {
-                        setState(() {
-                          _showFilterSelector = !_showFilterSelector;
-                        });
-                      },
-                      tooltip: 'Filters',
                     ),
                     GestureDetector(
                       onTap: _isCapturing ? null : _takePicture,
@@ -363,8 +525,8 @@ class _CameraScreenState extends State<CameraScreen>
                         width: 70,
                         height: 70,
                         decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(
-                            _isCapturing ? 0.3 : 0.9,
+                          color: Colors.white.withValues(
+                            alpha: _isCapturing ? 0.3 : 0.9,
                           ),
                           shape: BoxShape.circle,
                           border: Border.all(color: Colors.white, width: 3),
@@ -378,25 +540,42 @@ class _CameraScreenState extends State<CameraScreen>
                                     strokeWidth: 3,
                                   ),
                                 )
-                                : const Icon(
-                                  Icons.camera_alt,
-                                  color: Colors.black,
-                                  size: 36,
+                                : _buildRotatedUIElement(
+                                  const Icon(
+                                    Icons.camera_alt,
+                                    color: Colors.black,
+                                    size: 36,
+                                  ),
                                 ),
                       ),
                     ),
-                    IconButton(
-                      icon: Icon(
-                        _cameraController.currentFlashMode == FlashMode.off
-                            ? Icons.flash_off
-                            : _cameraController.currentFlashMode == FlashMode.on
-                            ? Icons.flash_on
-                            : Icons.flash_auto,
-                        color: Colors.white,
-                        size: 30,
+                    _buildRotatedUIElement(
+                      IconButton(
+                        icon: Icon(
+                          Icons.tune,
+                          color:
+                              _showManualControls ? Colors.blue : Colors.white,
+                          size: 30,
+                        ),
+                        onPressed: _toggleManualControls,
+                        tooltip: 'Manual Controls',
                       ),
-                      onPressed: _toggleFlash,
-                      tooltip: 'Toggle Flash',
+                    ),
+                    _buildRotatedUIElement(
+                      IconButton(
+                        icon: Icon(
+                          _cameraController.currentFlashMode == FlashMode.off
+                              ? Icons.flash_off
+                              : _cameraController.currentFlashMode ==
+                                  FlashMode.on
+                              ? Icons.flash_on
+                              : Icons.flash_auto,
+                          color: Colors.white,
+                          size: 30,
+                        ),
+                        onPressed: _toggleFlash,
+                        tooltip: 'Toggle Flash',
+                      ),
                     ),
                   ],
                 ),
@@ -412,38 +591,39 @@ class _CameraScreenState extends State<CameraScreen>
                 children: [
                   Container(
                     decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.4),
+                      color: Colors.black.withValues(alpha: 0.4),
                       shape: BoxShape.circle,
                     ),
-                    child: IconButton(
-                      icon: const Icon(
-                        Icons.flip_camera_ios,
-                        color: Colors.white,
-                        size: 28,
+                    child: _buildRotatedUIElement(
+                      IconButton(
+                        icon: const Icon(
+                          Icons.flip_camera_ios,
+                          color: Colors.white,
+                          size: 28,
+                        ),
+                        onPressed: _switchCamera,
+                        tooltip: 'Switch Camera',
                       ),
-                      onPressed: _switchCamera,
-                      tooltip: 'Switch Camera',
                     ),
                   ),
                   const SizedBox(height: 16),
                   // Zoom Slider (Vertical)
-                  if (_cameraController
-                      .isCameraInitialized) // Only show if camera is ready
+                  if (_cameraController.isCameraInitialized)
                     Container(
                       width: 40,
                       height: 150,
                       decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.4),
+                        color: Colors.black.withValues(alpha: 0.4),
                         borderRadius: BorderRadius.circular(20),
                       ),
                       padding: const EdgeInsets.symmetric(vertical: 8.0),
                       child: RotatedBox(
-                        quarterTurns: 3, // Makes slider vertical, thumb on left
+                        quarterTurns: 3,
                         child: Slider(
                           value: _cameraController.currentZoomLevel,
                           min: 0.0,
                           max: 1.0,
-                          divisions: 20, // Optional: for discrete steps
+                          divisions: 20,
                           onChanged: _setZoom,
                           activeColor: Colors.white,
                           inactiveColor: Colors.white30,
@@ -454,7 +634,7 @@ class _CameraScreenState extends State<CameraScreen>
               ),
             ),
 
-            // Display last captured image thumbnail (optional)
+            // Display last captured image thumbnail
             if (_lastCapturedImagePath != null)
               Positioned(
                 bottom: 140,
@@ -488,6 +668,7 @@ class FilterButton extends StatelessWidget {
   final CameraFilter filter;
   final CameraFilter currentFilter;
   final Function(CameraFilter) onPressed;
+  final double rotation;
 
   const FilterButton({
     super.key,
@@ -495,50 +676,55 @@ class FilterButton extends StatelessWidget {
     required this.filter,
     required this.currentFilter,
     required this.onPressed,
+    this.rotation = 0.0,
   });
 
   @override
   Widget build(BuildContext context) {
     final isSelected = filter == currentFilter;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        GestureDetector(
-          onTap: () => onPressed(filter),
-          child: Container(
-            width: 50,
-            height: 50,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: isSelected ? Colors.amber : Colors.grey[700]!,
-                width: 2,
+    return Transform.rotate(
+      angle: rotation,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          GestureDetector(
+            onTap: () => onPressed(filter),
+            child: Container(
+              width: 50,
+              height: 50,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: isSelected ? Colors.amber : Colors.grey[700]!,
+                  width: 2,
+                ),
+                color: Colors.grey[850],
               ),
-              color: Colors.grey[850],
-            ),
-            child: Center(
-              child: Text(
-                name.isNotEmpty ? name.substring(0, 1).toUpperCase() : 'F',
-                style: TextStyle(
-                  color: isSelected ? Colors.amber : Colors.white,
-                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                  fontSize: 16,
+              child: Center(
+                child: Text(
+                  name.isNotEmpty ? name.substring(0, 1).toUpperCase() : 'F',
+                  style: TextStyle(
+                    color: isSelected ? Colors.amber : Colors.white,
+                    fontWeight:
+                        isSelected ? FontWeight.bold : FontWeight.normal,
+                    fontSize: 16,
+                  ),
                 ),
               ),
             ),
           ),
-        ),
-        const SizedBox(height: 4),
-        Text(
-          name,
-          style: TextStyle(
-            color: isSelected ? Colors.amber : Colors.white70,
-            fontSize: 10,
-            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+          const SizedBox(height: 4),
+          Text(
+            name,
+            style: TextStyle(
+              color: isSelected ? Colors.amber : Colors.white70,
+              fontSize: 10,
+              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+            ),
+            overflow: TextOverflow.ellipsis,
           ),
-          overflow: TextOverflow.ellipsis,
-        ),
-      ],
+        ],
+      ),
     );
   }
 }

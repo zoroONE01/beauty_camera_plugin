@@ -50,7 +50,8 @@ class CameraManager(private val activity: Activity) {
     private var currentFilterIntensity = 1.0f
     private var isBackCamera = true
     private var flashMode = ImageCapture.FLASH_MODE_OFF
-    private var currentTargetRotation: Int? = null // Store current target rotation
+    private var currentExposure = 0.0f
+    private var isAutoFocusEnabled = true
     
     // Threading
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -85,11 +86,6 @@ class CameraManager(private val activity: Activity) {
     // New method to accept FilteredTextureView
     fun setFilteredTextureView(view: FilteredTextureView) {
         this.filteredTextureView = view
-        // Update its orientation immediately if we already have a target rotation
-        // currentTargetRotation?.let { surfaceRotation -> // REMOVED - FTV no longer needs display orientation
-        //     val degrees = degreesFromSurfaceRotation(surfaceRotation)
-        //     view.updateDisplayOrientation(degrees)
-        // }
         // Only start camera if cameraProvider is already initialized
         if (cameraProvider != null) {
             startCamera()
@@ -138,8 +134,15 @@ class CameraManager(private val activity: Activity) {
             imageCapture = createImageCaptureUseCase()
 
             // Build image analysis use case
-            // Ensure currentTargetRotation is non-null, fallback to display rotation if necessary
-            val rotationForAnalysis = currentTargetRotation ?: activity.display?.rotation ?: android.view.Surface.ROTATION_0
+            // Use real-time device orientation for consistent image analysis  
+            val deviceOrientation = orientationStreamHandler.getCurrentDeviceOrientation()
+            val rotationForAnalysis = when (deviceOrientation) {
+                0 -> android.view.Surface.ROTATION_0
+                90 -> android.view.Surface.ROTATION_90
+                180 -> android.view.Surface.ROTATION_180
+                270 -> android.view.Surface.ROTATION_270
+                else -> android.view.Surface.ROTATION_0
+            }
             imageAnalysis = createImageAnalysisUseCase(rotationForAnalysis)
 
             // Bind use cases to lifecycle
@@ -167,15 +170,29 @@ class CameraManager(private val activity: Activity) {
     }
 
     private fun createPreviewUseCase(): Preview {
-        // Use a default rotation or the activity's display rotation if filteredTextureView is not yet available
-        val displayRotation = activity.display?.rotation ?: android.view.Surface.ROTATION_0
-        val rotationToApply = currentTargetRotation ?: displayRotation
+        // FIXED ROTATION: Always use ROTATION_0 to prevent preview auto-rotation
+        // Preview should maintain consistent orientation regardless of device rotation
         return Preview.Builder()
             .apply {
-                setTargetRotation(rotationToApply)
+                setTargetRotation(android.view.Surface.ROTATION_0) // Fixed rotation
+                
+                // Add Camera2 interop to enforce rotation locking
+                val camera2Interop = Camera2Interop.Extender(this)
+                
+                // Lock the sensor orientation to prevent auto-rotation
+                camera2Interop.setCaptureRequestOption(
+                    CaptureRequest.JPEG_ORIENTATION, 
+                    0 // Always 0 degrees for consistent preview
+                )
+                
+                // Disable auto-rotation and stabilization that might affect orientation
+                camera2Interop.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                )
+                
                 if (currentFilterType != "none") {
                     // Apply camera2 specific options for live preview filter
-                    val camera2Interop = Camera2Interop.Extender(this)
                     applyEffectToPreview(camera2Interop, currentFilterType)
                 }
             }
@@ -183,11 +200,21 @@ class CameraManager(private val activity: Activity) {
     }
 
     private fun createImageCaptureUseCase(): ImageCapture {
-        val displayRotation = activity.display?.rotation ?: android.view.Surface.ROTATION_0
-        val rotationToApply = currentTargetRotation ?: displayRotation
+        // FOR CAPTURED IMAGES: Use current device orientation to ensure proper metadata
+        val deviceOrientation = orientationStreamHandler.getCurrentDeviceOrientation()
+        val targetRotation = when (deviceOrientation) {
+            0 -> android.view.Surface.ROTATION_0    // Portrait
+            90 -> android.view.Surface.ROTATION_90   // Landscape right
+            180 -> android.view.Surface.ROTATION_180 // Portrait upside down
+            270 -> android.view.Surface.ROTATION_270 // Landscape left
+            else -> android.view.Surface.ROTATION_0  // Default to portrait
+        }
+        
+        Log.d(TAG, "createImageCaptureUseCase: Device orientation: $deviceOrientation°, Target rotation: $targetRotation")
+        
         return ImageCapture.Builder()
             .apply {
-                setTargetRotation(rotationToApply)
+                setTargetRotation(targetRotation) // Use device orientation for correct image capture
                 setFlashMode(flashMode)
                 setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
             }
@@ -198,12 +225,13 @@ class CameraManager(private val activity: Activity) {
         private fun createImageAnalysisUseCase(targetRotationForUseCase: Int): ImageAnalysis {
             Log.d(TAG, "createImageAnalysisUseCase: Setting targetRotation to: $targetRotationForUseCase (Surface.ROTATION_*)")
             return ImageAnalysis.Builder()
-                .setTargetRotation(targetRotationForUseCase) // Quan trọng!
+                .setTargetRotation(android.view.Surface.ROTATION_0) // Fixed rotation for consistent analysis
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
                 .also {
-                    // Pass the targetRotationForUseCase to the BitmapProcessor
-                    it.setAnalyzer(cameraExecutor, BitmapProcessor(targetRotationForUseCase))
+                    // Pass the device orientation to the BitmapProcessor for proper rotation handling
+                    val deviceOrientation = orientationStreamHandler.getCurrentDeviceOrientation()
+                    it.setAnalyzer(cameraExecutor, BitmapProcessor(deviceOrientation))
                 }
         }
 
@@ -239,37 +267,39 @@ class CameraManager(private val activity: Activity) {
     }
 
 
-    // Modified to accept the configured Surface rotation for the ImageAnalysis use case
-    private inner class BitmapProcessor(private val configuredSurfaceRotationForAnalyzer: Int) : ImageAnalysis.Analyzer {
+    // Modified to accept the configured device orientation (in degrees) for the ImageAnalysis use case
+    private inner class BitmapProcessor(private val deviceOrientationDegrees: Int) : ImageAnalysis.Analyzer {
         private var frameCounter = 0
         private val maxFramesToSave = 3 // Save 3 frames for debugging
 
         @androidx.camera.core.ExperimentalGetImage
         override fun analyze(image: ImageProxy) {
             val imageProxyRotationDegrees = image.imageInfo.rotationDegrees // This is from ImageProxy
-            Log.d(TAG, "BitmapProcessor: analyze() called. ImageProxy rotationDegrees: $imageProxyRotationDegrees, Image W: ${image.width}, H: ${image.height}, Format: ${image.format}")
+            Log.d(TAG, "BitmapProcessor: Device orientation: ${deviceOrientationDegrees}°, ImageProxy rotation: ${imageProxyRotationDegrees}°")
 
             val unrotatedBitmap = image.toBitmap()
 
             if (unrotatedBitmap != null) {
                 Log.d(TAG, "BitmapProcessor: unrotatedBitmap created. W: ${unrotatedBitmap.width}, H: ${unrotatedBitmap.height}")
-                // saveBitmapForDebug(unrotatedBitmap, "debug_unrotated_${System.currentTimeMillis()}_${imageProxyRotationDegrees}deg.jpg")
-
+                
+                // Calculate total rotation needed: device orientation + image proxy rotation
+                val totalRotationDegrees = (deviceOrientationDegrees + imageProxyRotationDegrees) % 360
+                
                 val rotatedBitmap: Bitmap
-                if (imageProxyRotationDegrees != 0) {
-                    val matrix = Matrix().apply { postRotate(imageProxyRotationDegrees.toFloat()) }
+                if (totalRotationDegrees != 0) {
+                    val matrix = Matrix().apply { postRotate(totalRotationDegrees.toFloat()) }
                     rotatedBitmap = Bitmap.createBitmap(
                         unrotatedBitmap, 0, 0, unrotatedBitmap.width, unrotatedBitmap.height, matrix, true
                     )
-                    Log.d(TAG, "BitmapProcessor: rotatedBitmap created with ${imageProxyRotationDegrees}deg. W: ${rotatedBitmap.width}, H: ${rotatedBitmap.height}")
+                    Log.d(TAG, "BitmapProcessor: rotatedBitmap created with ${totalRotationDegrees}° total rotation. W: ${rotatedBitmap.width}, H: ${rotatedBitmap.height}")
                     if (unrotatedBitmap !== rotatedBitmap && !unrotatedBitmap.isRecycled) {
-                        // unrotatedBitmap.recycle(); // Keep for now if saving for debug
+                        // Dispose unrotated bitmap if a new one was created
+                        unrotatedBitmap.recycle()
                     }
                 } else {
                     rotatedBitmap = unrotatedBitmap // No rotation needed
                     Log.d(TAG, "BitmapProcessor: rotatedBitmap is unrotatedBitmap (no rotation needed). W: ${rotatedBitmap.width}, H: ${rotatedBitmap.height}")
                 }
-                // saveBitmapForDebug(rotatedBitmap, "debug_rotated_${System.currentTimeMillis()}_${imageProxyRotationDegrees}deg.jpg")
 
 
                 var bitmapToProcess = rotatedBitmap
@@ -504,7 +534,14 @@ class CameraManager(private val activity: Activity) {
 
             // Create new imageAnalysis use case (its analyzer will pick up currentFilterType)
             // Pass the current device orientation to it
-            val rotationForAnalysisOnFilterChange = currentTargetRotation ?: activity.display?.rotation ?: android.view.Surface.ROTATION_0
+            val deviceOrientation = orientationStreamHandler.getCurrentDeviceOrientation()
+            val rotationForAnalysisOnFilterChange = when (deviceOrientation) {
+                0 -> android.view.Surface.ROTATION_0
+                90 -> android.view.Surface.ROTATION_90
+                180 -> android.view.Surface.ROTATION_180
+                270 -> android.view.Surface.ROTATION_270
+                else -> android.view.Surface.ROTATION_0
+            }
             Log.e(TAG, "applyFilterToCamera: Passing rotation $rotationForAnalysisOnFilterChange to createImageAnalysisUseCase.")
             imageAnalysis = createImageAnalysisUseCase(rotationForAnalysisOnFilterChange)
             
@@ -745,56 +782,56 @@ class CameraManager(private val activity: Activity) {
         camera?.cameraControl?.setLinearZoom(zoomLevel)
     }
 
-    fun updateTargetRotation(rotation: Int) { // rotation is Surface.ROTATION_*
-        Log.e(TAG, "updateTargetRotation CALLED. New SurfaceRotation: $rotation, Old: ${currentTargetRotation ?: "null"}")
-        if (currentTargetRotation == rotation && camera != null) {
-            Log.d(TAG, "updateTargetRotation: Rotation unchanged ($rotation). No action needed.") // Changed Log.e to Log.d
-            // filteredTextureView?.let { // REMOVED - FTV no longer needs display orientation
-            //     val degrees = degreesFromSurfaceRotation(rotation)
-            //     it.updateDisplayOrientation(degrees)
-            // }
-            return
-        }
+    fun setExposure(exposure: Float) {
+        val exposureValue = exposure.coerceIn(-2.0f, 2.0f)
+        currentExposure = exposureValue
         
-        this.currentTargetRotation = rotation
-        Log.d(TAG, "updateTargetRotation: currentTargetRotation (Surface rotation) updated to: $currentTargetRotation") // Changed Log.e to Log.d
-
-        // Revert to calling startCamera() to ensure ImageAnalysis use case is reconfigured
-        // with the new targetRotation, which affects image.imageInfo.rotationDegrees.
-        if (cameraProvider != null && activity != null) {
-            Log.d(TAG, "updateTargetRotation: Calling startCamera() due to rotation change.") // Changed Log.e to Log.d
-            startCamera() // This will rebind use cases with the new currentTargetRotation
-            Log.d(TAG, "updateTargetRotation: startCamera() CALL COMPLETE.") // Changed Log.e to Log.d
-        } else {
-            Log.e(TAG, "updateTargetRotation: CANNOT call startCamera(). cameraProvider: $cameraProvider, activity: $activity")
-            // If we can't restart camera, no FTV update is needed here as it doesn't handle orientation anymore
-            // filteredTextureView?.let { // REMOVED
-            //     val degrees = degreesFromSurfaceRotation(rotation)
-            //     it.updateDisplayOrientation(degrees)
-            //     Log.e(TAG, "updateTargetRotation: Updated FTV orientation directly as camera could not be restarted.")
-            // }
-            return
+        try {
+            camera?.cameraControl?.setExposureCompensationIndex(
+                (exposureValue * 2).toInt() // Convert to EV steps (assuming 0.5 EV per step)
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to set exposure: ${e.message}")
         }
-        
-        // After startCamera() has (hopefully) reconfigured ImageAnalysis,
-        // FTV no longer needs its display orientation updated from here.
-        // filteredTextureView?.let { // REMOVED
-        //     val degrees = degreesFromSurfaceRotation(rotation)
-        //     it.updateDisplayOrientation(degrees)
-        //     Log.e(TAG, "updateTargetRotation: Called updateDisplayOrientation on FTV with $degrees degrees AFTER startCamera().")
-        // }
     }
 
-    // Helper function to convert Surface.ROTATION_* to degrees for canvas rotation // REMOVED - No longer needed
-    // private fun degreesFromSurfaceRotation(surfaceRotation: Int): Float {
-    //     return when (surfaceRotation) {
-    //         android.view.Surface.ROTATION_0 -> 0f
-    //         android.view.Surface.ROTATION_90 -> 270f
-    //         android.view.Surface.ROTATION_180 -> 180f
-    //         android.view.Surface.ROTATION_270 -> 90f
-    //         else -> 0f
-    //     }
-    // }
+    fun setFocusPoint(x: Float, y: Float) {
+        val normalizedX = x.coerceIn(0.0f, 1.0f)
+        val normalizedY = y.coerceIn(0.0f, 1.0f)
+        
+        try {
+            // Create focus and metering action using display-based metering point factory
+            filteredTextureView?.let { textureView ->
+                // Create metering point factory based on the texture view dimensions
+                val factory = SurfaceOrientedMeteringPointFactory(
+                    textureView.width.toFloat(), 
+                    textureView.height.toFloat()
+                )
+                val point = factory.createPoint(normalizedX, normalizedY)
+                val action = FocusMeteringAction.Builder(point)
+                    .addPoint(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                    .build()
+                camera?.cameraControl?.startFocusAndMetering(action)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to set focus point: ${e.message}")
+        }
+    }
+
+    fun setAutoFocus(enabled: Boolean) {
+        isAutoFocusEnabled = enabled
+        
+        try {
+            if (!enabled) {
+                // Disable auto focus by setting manual focus
+                camera?.cameraControl?.cancelFocusAndMetering()
+            }
+            // Note: CameraX doesn't have a direct way to disable AF completely
+            // This is a simplified implementation
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to set auto focus: ${e.message}")
+        }
+    }
 
     fun dispose() {
         try {
