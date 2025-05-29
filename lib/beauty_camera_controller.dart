@@ -25,6 +25,7 @@ class BeautyCameraController extends ChangeNotifier {
       BeautyCameraPluginPlatform.instance;
 
   StreamSubscription<OrientationData>? _orientationSubscription;
+  CameraOrientation? _lastNotifiedOrientation;
 
   bool get isCameraInitialized => _isCameraInitialized;
   String? get lastErrorMessage => _lastErrorMessage;
@@ -42,11 +43,14 @@ class BeautyCameraController extends ChangeNotifier {
     _orientationSubscription = _platform.orientationStream.listen(
       (orientationData) {
         _currentOrientationData = orientationData;
-        // Notify listeners if you want the UI to react to orientation data changes directly
-        // notifyListeners();
-        // Or, you might want to pass this data to the native side if needed for preview/capture
-        // For example, if the native side needs UI orientation for rotations
-        // _platform.updateCameraRotation(orientationData.uiOrientation);
+        
+        // Only notify listeners when orientation changes to specific angles
+        final newOrientation = orientationData.deviceOrientation;
+        if (_lastNotifiedOrientation != newOrientation) {
+          _lastNotifiedOrientation = newOrientation;
+          // Notify listeners so UI can react to orientation data changes
+          notifyListeners();
+        }
       },
       onError: (error) {
         if (kDebugMode) {

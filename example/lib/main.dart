@@ -60,8 +60,11 @@ class CameraScreen extends StatefulWidget {
 }
 
 class _CameraScreenState extends State<CameraScreen>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, TickerProviderStateMixin {
   late final BeautyCameraController _cameraController;
+  late final AnimationController _rotationAnimationController;
+  late Animation<double> _rotationAnimation;
+  
   bool _permissionsGranted = false;
   bool _isCapturing = false;
   String? _lastCapturedImagePath;
@@ -72,6 +75,7 @@ class _CameraScreenState extends State<CameraScreen>
 
   // Add orientation tracking for UI rotation while keeping screen locked
   CameraOrientation _deviceOrientation = CameraOrientation.portraitUp;
+  double _currentRotationAngle = 0.0;
 
   @override
   void initState() {
@@ -79,6 +83,20 @@ class _CameraScreenState extends State<CameraScreen>
 
     // Enforce portrait orientation lock for screen
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+
+    // Initialize rotation animation controller
+    _rotationAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 300),
+      vsync: this,
+    );
+    
+    _rotationAnimation = Tween<double>(
+      begin: 0.0,
+      end: 0.0,
+    ).animate(CurvedAnimation(
+      parent: _rotationAnimationController,
+      curve: Curves.easeInOut,
+    ));
 
     WidgetsBinding.instance.addObserver(this);
     _cameraController = BeautyCameraController();
@@ -91,11 +109,35 @@ class _CameraScreenState extends State<CameraScreen>
       setState(() {
         // Update device orientation tracking for UI rotation
         if (_cameraController.currentOrientationData != null) {
-          _deviceOrientation =
-              _cameraController.currentOrientationData!.deviceOrientation;
+          final newOrientation = _cameraController.currentOrientationData!.deviceOrientation;
+          
+          // Only update and animate if orientation actually changed
+          if (_deviceOrientation != newOrientation) {
+            _deviceOrientation = newOrientation;
+            _updateRotationAnimation();
+          }
         }
       });
     }
+  }
+
+  void _updateRotationAnimation() {
+    final newAngle = _getUIRotationAngle();
+    
+    // Update the animation with new rotation angle
+    _rotationAnimation = Tween<double>(
+      begin: _currentRotationAngle,
+      end: newAngle,
+    ).animate(CurvedAnimation(
+      parent: _rotationAnimationController,
+      curve: Curves.easeInOut,
+    ));
+    
+    // Start the animation
+    _rotationAnimationController.reset();
+    _rotationAnimationController.forward().then((_) {
+      _currentRotationAngle = newAngle;
+    });
   }
 
   // Calculate rotation angle for UI elements based on device orientation
@@ -112,9 +154,18 @@ class _CameraScreenState extends State<CameraScreen>
     }
   }
 
-  // Helper to build UI elements that rotate with device orientation
+  // Helper to build UI elements that rotate with device orientation using animation
   Widget _buildRotatedUIElement(Widget child) {
-    return Transform.rotate(angle: _getUIRotationAngle(), child: child);
+    return AnimatedBuilder(
+      animation: _rotationAnimation,
+      builder: (context, child) {
+        return Transform.rotate(
+          angle: _rotationAnimation.value,
+          child: child,
+        );
+      },
+      child: child,
+    );
   }
 
   Future<void> _requestPermissionsAndInitialize() async {
@@ -280,6 +331,7 @@ class _CameraScreenState extends State<CameraScreen>
     WidgetsBinding.instance.removeObserver(this);
     _cameraController.removeListener(_onControllerUpdate);
     _cameraController.dispose();
+    _rotationAnimationController.dispose();
     super.dispose();
   }
 
@@ -335,10 +387,12 @@ class _CameraScreenState extends State<CameraScreen>
                     color: Colors.red.withValues(alpha: 0.7),
                     borderRadius: BorderRadius.circular(4),
                   ),
-                  child: Text(
-                    _cameraController.lastErrorMessage!,
-                    style: const TextStyle(color: Colors.white),
-                    textAlign: TextAlign.center,
+                  child: _buildRotatedUIElement(
+                    Text(
+                      _cameraController.lastErrorMessage!,
+                      style: const TextStyle(color: Colors.white),
+                      textAlign: TextAlign.center,
+                    ),
                   ),
                 ),
               ),
@@ -370,7 +424,7 @@ class _CameraScreenState extends State<CameraScreen>
                             name: filter.displayName,
                             filter: filter,
                             currentFilter: _cameraController.currentFilter,
-                            rotation: _getUIRotationAngle(),
+                            rotationAnimation: _rotationAnimation,
                             onPressed: (selectedFilter) {
                               _setFilter(selectedFilter);
                             },
@@ -385,9 +439,11 @@ class _CameraScreenState extends State<CameraScreen>
                         padding: const EdgeInsets.symmetric(horizontal: 16.0),
                         child: Row(
                           children: [
-                            const Text(
-                              'Intensity',
-                              style: TextStyle(color: Colors.white),
+                            _buildRotatedUIElement(
+                              const Text(
+                                'Intensity',
+                                style: TextStyle(color: Colors.white),
+                              ),
                             ),
                             Expanded(
                               child: Slider(
@@ -433,9 +489,11 @@ class _CameraScreenState extends State<CameraScreen>
                             ),
                           ),
                           const SizedBox(width: 8),
-                          const Text(
-                            'Exposure',
-                            style: TextStyle(color: Colors.white, fontSize: 12),
+                          _buildRotatedUIElement(
+                            const Text(
+                              'Exposure',
+                              style: TextStyle(color: Colors.white, fontSize: 12),
+                            ),
                           ),
                           Expanded(
                             child: Slider(
@@ -449,11 +507,13 @@ class _CameraScreenState extends State<CameraScreen>
                               label: _currentExposure.toStringAsFixed(1),
                             ),
                           ),
-                          Text(
-                            _currentExposure.toStringAsFixed(1),
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 12,
+                          _buildRotatedUIElement(
+                            Text(
+                              _currentExposure.toStringAsFixed(1),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                              ),
                             ),
                           ),
                         ],
@@ -469,9 +529,11 @@ class _CameraScreenState extends State<CameraScreen>
                             ),
                           ),
                           const SizedBox(width: 8),
-                          const Text(
-                            'Auto Focus',
-                            style: TextStyle(color: Colors.white, fontSize: 12),
+                          _buildRotatedUIElement(
+                            const Text(
+                              'Auto Focus',
+                              style: TextStyle(color: Colors.white, fontSize: 12),
+                            ),
                           ),
                           const Spacer(),
                           Switch(
@@ -609,24 +671,26 @@ class _CameraScreenState extends State<CameraScreen>
                   const SizedBox(height: 16),
                   // Zoom Slider (Vertical)
                   if (_cameraController.isCameraInitialized)
-                    Container(
-                      width: 40,
-                      height: 150,
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.4),
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      padding: const EdgeInsets.symmetric(vertical: 8.0),
-                      child: RotatedBox(
-                        quarterTurns: 3,
-                        child: Slider(
-                          value: _cameraController.currentZoomLevel,
-                          min: 0.0,
-                          max: 1.0,
-                          divisions: 20,
-                          onChanged: _setZoom,
-                          activeColor: Colors.white,
-                          inactiveColor: Colors.white30,
+                    _buildRotatedUIElement(
+                      Container(
+                        width: 40,
+                        height: 150,
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.4),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        padding: const EdgeInsets.symmetric(vertical: 8.0),
+                        child: RotatedBox(
+                          quarterTurns: 3,
+                          child: Slider(
+                            value: _cameraController.currentZoomLevel,
+                            min: 0.0,
+                            max: 1.0,
+                            divisions: 20,
+                            onChanged: _setZoom,
+                            activeColor: Colors.white,
+                            inactiveColor: Colors.white30,
+                          ),
                         ),
                       ),
                     ),
@@ -639,17 +703,19 @@ class _CameraScreenState extends State<CameraScreen>
               Positioned(
                 bottom: 140,
                 left: 16,
-                child: GestureDetector(
-                  onTap: () => _showPhotoPreviewDialog(_lastCapturedImagePath!),
-                  child: Container(
-                    width: 60,
-                    height: 80,
-                    decoration: BoxDecoration(
-                      border: Border.all(color: Colors.white, width: 2),
-                      borderRadius: BorderRadius.circular(8),
-                      image: DecorationImage(
-                        image: FileImage(File(_lastCapturedImagePath!)),
-                        fit: BoxFit.cover,
+                child: _buildRotatedUIElement(
+                  GestureDetector(
+                    onTap: () => _showPhotoPreviewDialog(_lastCapturedImagePath!),
+                    child: Container(
+                      width: 60,
+                      height: 80,
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.white, width: 2),
+                        borderRadius: BorderRadius.circular(8),
+                        image: DecorationImage(
+                          image: FileImage(File(_lastCapturedImagePath!)),
+                          fit: BoxFit.cover,
+                        ),
                       ),
                     ),
                   ),
@@ -668,7 +734,7 @@ class FilterButton extends StatelessWidget {
   final CameraFilter filter;
   final CameraFilter currentFilter;
   final Function(CameraFilter) onPressed;
-  final double rotation;
+  final Animation<double> rotationAnimation;
 
   const FilterButton({
     super.key,
@@ -676,55 +742,60 @@ class FilterButton extends StatelessWidget {
     required this.filter,
     required this.currentFilter,
     required this.onPressed,
-    this.rotation = 0.0,
+    required this.rotationAnimation,
   });
 
   @override
   Widget build(BuildContext context) {
     final isSelected = filter == currentFilter;
-    return Transform.rotate(
-      angle: rotation,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          GestureDetector(
-            onTap: () => onPressed(filter),
-            child: Container(
-              width: 50,
-              height: 50,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                border: Border.all(
-                  color: isSelected ? Colors.amber : Colors.grey[700]!,
-                  width: 2,
-                ),
-                color: Colors.grey[850],
-              ),
-              child: Center(
-                child: Text(
-                  name.isNotEmpty ? name.substring(0, 1).toUpperCase() : 'F',
-                  style: TextStyle(
-                    color: isSelected ? Colors.amber : Colors.white,
-                    fontWeight:
-                        isSelected ? FontWeight.bold : FontWeight.normal,
-                    fontSize: 16,
+    return AnimatedBuilder(
+      animation: rotationAnimation,
+      builder: (context, child) {
+        return Transform.rotate(
+          angle: rotationAnimation.value,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              GestureDetector(
+                onTap: () => onPressed(filter),
+                child: Container(
+                  width: 50,
+                  height: 50,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: isSelected ? Colors.amber : Colors.grey[700]!,
+                      width: 2,
+                    ),
+                    color: Colors.grey[850],
+                  ),
+                  child: Center(
+                    child: Text(
+                      name.isNotEmpty ? name.substring(0, 1).toUpperCase() : 'F',
+                      style: TextStyle(
+                        color: isSelected ? Colors.amber : Colors.white,
+                        fontWeight:
+                            isSelected ? FontWeight.bold : FontWeight.normal,
+                        fontSize: 16,
+                      ),
+                    ),
                   ),
                 ),
               ),
-            ),
+              const SizedBox(height: 4),
+              Text(
+                name,
+                style: TextStyle(
+                  color: isSelected ? Colors.amber : Colors.white70,
+                  fontSize: 10,
+                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
           ),
-          const SizedBox(height: 4),
-          Text(
-            name,
-            style: TextStyle(
-              color: isSelected ? Colors.amber : Colors.white70,
-              fontSize: 10,
-              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-            ),
-            overflow: TextOverflow.ellipsis,
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 }
