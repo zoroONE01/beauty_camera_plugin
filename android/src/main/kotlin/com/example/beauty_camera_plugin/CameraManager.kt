@@ -131,8 +131,6 @@ class CameraManager(private val activity: Activity) {
 
             // Build preview use case.
             // Even if not displayed directly, CameraX might require it.
-            // We won't set its surface provider to the old PreviewView.
-            // If ImageAnalysis is the sole source for display, Preview's output might not be used.
             preview = createPreviewUseCase()
             // preview?.setSurfaceProvider(currentPreviewView.surfaceProvider) // No longer setting to a PreviewView
 
@@ -584,6 +582,13 @@ class CameraManager(private val activity: Activity) {
             return
         }
 
+        // Ensure flash mode is correctly set on the capture instance
+        // This might be slightly redundant if toggleFlash and startCamera handle it perfectly,
+        // but acts as a safeguard.
+        captureInstance.flashMode = this.flashMode // Directly set the flash mode on the existing instance
+        Log.d(TAG, "takePicture: Set flashMode on ImageCapture instance to: ${getFlashModeString()}")
+
+
         // Create output file
         val name = SimpleDateFormat(FILENAME_FORMAT, Locale.US)
             .format(System.currentTimeMillis())
@@ -625,8 +630,8 @@ class CameraManager(private val activity: Activity) {
                 }
 
                 override fun onError(exception: ImageCaptureException) {
-                    Log.e(TAG, "Photo capture failed", exception)
-                    callback(null, "Photo capture failed: ${exception.message}")
+                    Log.e(TAG, "Photo capture failed. Code: ${exception.imageCaptureError}, Message: ${exception.message}", exception)
+                    callback(null, "Photo capture failed: ${exception.message} (Code: ${exception.imageCaptureError})")
                 }
             }
         )
@@ -688,11 +693,18 @@ class CameraManager(private val activity: Activity) {
             ImageCapture.FLASH_MODE_AUTO -> ImageCapture.FLASH_MODE_OFF
             else -> ImageCapture.FLASH_MODE_OFF
         }
-        
+        Log.d(TAG, "Toggled flashMode to: ${getFlashModeString()}") // Added log
+
         // Update the image capture use case with new flash mode
-        imageCapture = createImageCaptureUseCase()
-        val lifecycleOwner = activity as? LifecycleOwner ?: return getFlashModeString()
+        // This creates a new instance configured with the new flashMode
+        imageCapture = createImageCaptureUseCase() 
         
+        val lifecycleOwner = activity as? LifecycleOwner ?: return getFlashModeString()
+        val provider = cameraProvider ?: run { // Added check for provider
+            Log.e(TAG, "toggleFlash: CameraProvider is null, cannot rebind.")
+            return getFlashModeString()
+        }
+
         try {
             val cameraSelector = if (isBackCamera) {
                 CameraSelector.DEFAULT_BACK_CAMERA
@@ -700,19 +712,21 @@ class CameraManager(private val activity: Activity) {
                 CameraSelector.DEFAULT_FRONT_CAMERA
             }
             
-            cameraProvider?.unbindAll()
+            Log.d(TAG, "Rebinding use cases for flash mode change.") // Added log
+            provider.unbindAll()
             val useCasesToBind = mutableListOf(preview, imageCapture, imageAnalysis).filterNotNull()
             if (useCasesToBind.isNotEmpty()) {
-                camera = cameraProvider?.bindToLifecycle(
+                camera = provider.bindToLifecycle(
                     lifecycleOwner,
                     cameraSelector,
                     *useCasesToBind.toTypedArray()
                 )
+                Log.d(TAG, "Use cases rebound successfully after flash mode change.") // Added log
             } else {
                 Log.e(TAG, "No valid use cases to bind after flash mode toggle.")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to update flash mode", e)
+            Log.e(TAG, "Failed to rebind use cases for flash mode change", e)
         }
         
         return getFlashModeString()
@@ -722,7 +736,7 @@ class CameraManager(private val activity: Activity) {
         return when (flashMode) {
             ImageCapture.FLASH_MODE_ON -> "on"
             ImageCapture.FLASH_MODE_AUTO -> "auto"
-            else -> "off"
+            else -> "off" // Covers FLASH_MODE_OFF and any other unexpected values
         }
     }
 

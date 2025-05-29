@@ -22,38 +22,21 @@ class _BeautyCameraViewState extends State<BeautyCameraView> {
   @override
   void initState() {
     super.initState();
-    // Listen to controller changes to rebuild if necessary
-    widget.controller.addListener(_onControllerUpdate);
+
     // Initialize camera if not already initialized
     if (!widget.controller.isCameraInitialized) {
       widget.controller.initializeCamera();
     }
   }
 
-  void _onControllerUpdate() {
-    if (mounted) {
-      setState(() {});
-    }
-  }
-
   @override
   void didUpdateWidget(BeautyCameraView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.controller != oldWidget.controller) {
-      oldWidget.controller.removeListener(_onControllerUpdate);
-      widget.controller.addListener(_onControllerUpdate);
+    if (widget.controller != oldWidget.controller &&
+        !widget.controller.isCameraInitialized) {
       // If controller changes, re-initialize if needed
-      if (!widget.controller.isCameraInitialized) {
-        widget.controller.initializeCamera();
-      }
+      widget.controller.initializeCamera();
     }
-  }
-
-  @override
-  void dispose() {
-    widget.controller.removeListener(_onControllerUpdate);
-    // Controller disposal should be handled by the owner of the controller
-    super.dispose();
   }
 
   @override
